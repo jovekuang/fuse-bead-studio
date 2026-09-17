@@ -2,7 +2,7 @@ import Fastify from "fastify";
 import multipart from "@fastify/multipart";
 import fastifyStatic from "@fastify/static";
 import Database from "better-sqlite3";
-import { createWriteStream } from "node:fs";
+import { createWriteStream, readFileSync } from "node:fs";
 import { mkdir, unlink } from "node:fs/promises";
 import { pipeline } from "node:stream/promises";
 import { randomUUID } from "node:crypto";
@@ -12,7 +12,20 @@ import { createWorker, PSM } from "tesseract.js";
 import { PALETTE, PALETTE_CODES, countBeads } from "../shared/palette.js";
 
 const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-const dataDir = process.env.DATA_DIR ?? path.join(projectRoot, "data");
+const configPath = process.env.APP_CONFIG ?? path.join(projectRoot, "app.config.json");
+const appConfig = (() => {
+  try {
+    const parsed = JSON.parse(readFileSync(configPath, "utf8")) as { dataDirectory?: unknown };
+    if (parsed.dataDirectory !== undefined && (typeof parsed.dataDirectory !== "string" || !parsed.dataDirectory.trim()))
+      throw new Error("dataDirectory must be a non-empty string.");
+    return parsed;
+  } catch (cause) {
+    if ((cause as NodeJS.ErrnoException).code === "ENOENT") return {};
+    throw new Error(`Could not read ${configPath}: ${cause instanceof Error ? cause.message : String(cause)}`);
+  }
+})();
+const configuredDataDirectory = process.env.DATA_DIR ?? appConfig.dataDirectory ?? "data";
+const dataDir = path.resolve(projectRoot, configuredDataDirectory as string);
 const uploadDir = path.join(dataDir, "uploads");
 const distDir = path.join(projectRoot, "dist");
 await mkdir(uploadDir, { recursive: true });

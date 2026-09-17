@@ -1,6 +1,7 @@
 node_modules/
 dist/
 data/
+app.config.json
 .DS_Store
 *.log
 *.tsbuildinfo
