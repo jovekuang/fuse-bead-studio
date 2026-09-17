@@ -842,9 +842,14 @@ async function existingTemplateToGrid(file: File, progress: (message: string) =>
 }
 
 function BeadGrid({ draft, onPaint, compact = false, dragEnabled = true, zoom = 100, showEmptyMark = true, majorGrid = false, selectedIndices, selectionMode = false, onSelectRange }: { draft: Draft; onPaint?: (indices: number[]) => void; compact?: boolean; dragEnabled?: boolean; zoom?: number; showEmptyMark?: boolean; majorGrid?: boolean; selectedIndices?: Set<number>; selectionMode?: boolean; onSelectRange?: (indices: number[], baseSelection: Set<number>) => void }) {
-  const gesture = useRef<{ pointerId: number; pointerType: string; startIndex: number; lastIndex: number; x: number; y: number; drawing: boolean; baseSelection: Set<number> } | null>(null);
+  const gesture = useRef<{ pointerId: number; pointerType: string; startIndex: number; lastIndex: number; x: number; y: number; drawing: boolean; scrolling: boolean; baseSelection: Set<number>; holdTimer?: number; scrollTarget: HTMLElement | null; scrollLeft: number; scrollTop: number; pageX: number; pageY: number } | null>(null);
   const activeTouches = useRef(new Set<number>());
+  const [touchDrawing, setTouchDrawing] = useState(false);
   const cellSize = compact ? 5 : Math.max(majorGrid ? 1 : 6, Math.round(22 * zoom / 100));
+  const cancelHold = (current: typeof gesture.current) => {
+    if (current?.holdTimer !== undefined) window.clearTimeout(current.holdTimer);
+  };
+  useEffect(() => () => cancelHold(gesture.current), []);
   const cellFromPoint = (x: number, y: number, grid: HTMLDivElement) => {
     const target = document.elementFromPoint(x, y)?.closest<HTMLElement>("[data-cell-index]");
     return target && grid.contains(target) ? Number(target.dataset.cellIndex) : null;
@@ -853,33 +858,53 @@ function BeadGrid({ draft, onPaint, compact = false, dragEnabled = true, zoom = 
     if (event.pointerType === "touch") activeTouches.current.delete(event.pointerId);
     const current = gesture.current;
     if (!current || current.pointerId !== event.pointerId) return;
-    if (!cancelled && !current.drawing) onPaint?.([current.startIndex]);
+    cancelHold(current);
+    if (!cancelled && !current.drawing && !current.scrolling && (current.pointerType !== "touch" || !dragEnabled)) onPaint?.([current.startIndex]);
+    setTouchDrawing(false);
     gesture.current = null;
   };
-  return <div className={`bead-grid ${onPaint ? "editable" : ""} ${dragEnabled && onPaint ? "continuous-draw" : ""} ${selectionMode ? "selection-mode" : ""} ${compact ? "compact-grid" : ""} ${majorGrid && cellSize < 12 ? "fine-grid" : ""}`} style={{ gridTemplateColumns: `repeat(${draft.width}, ${cellSize}px)` }} onPointerDown={(event) => {
+  return <div className={`bead-grid ${onPaint ? "editable" : ""} ${dragEnabled && onPaint ? "continuous-draw" : ""} ${selectionMode ? "selection-mode" : ""} ${touchDrawing ? "touch-drawing" : ""} ${compact ? "compact-grid" : ""} ${majorGrid && cellSize < 12 ? "fine-grid" : ""}`} style={{ gridTemplateColumns: `repeat(${draft.width}, ${cellSize}px)` }} onPointerDown={(event) => {
     if (!onPaint || event.button !== 0) return;
     const index = cellFromPoint(event.clientX, event.clientY, event.currentTarget); if (index === null) return;
     if (event.pointerType === "touch") {
       activeTouches.current.add(event.pointerId);
-      if (activeTouches.current.size > 1) { gesture.current = null; return; }
+      if (activeTouches.current.size > 1) { cancelHold(gesture.current); gesture.current = null; setTouchDrawing(false); return; }
     }
-    gesture.current = { pointerId: event.pointerId, pointerType: event.pointerType, startIndex: index, lastIndex: index, x: event.clientX, y: event.clientY, drawing: !selectionMode && event.pointerType !== "touch", baseSelection: new Set(selectedIndices) };
+    const scrollTarget = event.currentTarget.closest<HTMLElement>(".grid-scroll");
+    gesture.current = { pointerId: event.pointerId, pointerType: event.pointerType, startIndex: index, lastIndex: index, x: event.clientX, y: event.clientY, drawing: !selectionMode && event.pointerType !== "touch", scrolling: false, baseSelection: new Set(selectedIndices), scrollTarget, scrollLeft: scrollTarget?.scrollLeft ?? 0, scrollTop: scrollTarget?.scrollTop ?? 0, pageX: window.scrollX, pageY: window.scrollY };
     event.currentTarget.setPointerCapture(event.pointerId);
-    if (!selectionMode && event.pointerType !== "touch") onPaint([index]);
+    if (event.pointerType === "touch" && dragEnabled) {
+      const pointerId = event.pointerId;
+      gesture.current.holdTimer = window.setTimeout(() => {
+        const current = gesture.current;
+        if (!current || current.pointerId !== pointerId || current.scrolling || activeTouches.current.size > 1) return;
+        current.drawing = true;
+        setTouchDrawing(true);
+        onPaint([current.startIndex]);
+      }, 240);
+    } else if (!selectionMode && event.pointerType !== "touch") onPaint([index]);
   }} onPointerMove={(event) => {
     const current = gesture.current;
     if (!current || current.pointerId !== event.pointerId || !dragEnabled || !onPaint || activeTouches.current.size > 1) return;
+    if (current.pointerType === "touch" && !current.drawing) {
+      const horizontalDistance = event.clientX - current.x;
+      const verticalDistance = event.clientY - current.y;
+      if (!current.scrolling && Math.hypot(horizontalDistance, verticalDistance) < 8) return;
+      if (!current.scrolling) { current.scrolling = true; cancelHold(current); }
+      const target = current.scrollTarget;
+      const scrollHorizontally = Boolean(target && target.scrollWidth > target.clientWidth + 1);
+      const scrollVertically = Boolean(target && target.scrollHeight > target.clientHeight + 1);
+      if (target && scrollHorizontally) target.scrollLeft = current.scrollLeft - horizontalDistance;
+      if (target && scrollVertically) target.scrollTop = current.scrollTop - verticalDistance;
+      if (!scrollHorizontally || !scrollVertically) window.scrollTo(!scrollHorizontally ? current.pageX - horizontalDistance : window.scrollX, !scrollVertically ? current.pageY - verticalDistance : window.scrollY);
+      return;
+    }
     const index = cellFromPoint(event.clientX, event.clientY, event.currentTarget); if (index === null) return;
     if (selectionMode) {
       if (!current.drawing && index === current.startIndex && Math.hypot(event.clientX - current.x, event.clientY - current.y) < 5) return;
       current.drawing = true; current.lastIndex = index;
       onSelectRange?.(rectangleCellIndices(current.startIndex, index, draft.width), current.baseSelection);
       return;
-    }
-    if (current.pointerType === "touch" && !current.drawing) {
-      if (Math.hypot(event.clientX - current.x, event.clientY - current.y) < 5) return;
-      current.drawing = true;
-      const indices = lineCellIndices(current.startIndex, index, draft.width); onPaint(indices); current.lastIndex = index; return;
     }
     if (index === current.lastIndex) return;
     const indices = lineCellIndices(current.lastIndex, index, draft.width).slice(1);
@@ -1186,8 +1211,8 @@ function TemplateEditor({ draft, setDraft, onSave, onCancel, busy }: { draft: Dr
           <button type="button" onClick={openResize} title="Change the board dimensions"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 4H4v5M15 20h5v-5M4 9l6-6M20 15l-6 6"/></svg><b>Resize</b></button>
           <button type="button" className={moveSelecting ? "active" : ""} onClick={() => moveSelecting ? (setMoveSelecting(false), setMoveSelection(new Set())) : startMoveSelection()} title="Select and move a group of beads" aria-pressed={moveSelecting}><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v18M3 12h18M12 3l-3 3M12 3l3 3M21 12l-3-3M21 12l-3 3M12 21l-3-3M12 21l3-3M3 12l3-3M3 12l3 3"/></svg><b>Move</b></button>
         </div>
-        {moveSelecting ? <div className="move-selection-panel"><strong>Select beads to move</strong><span>Tap to add or remove one bead. Drag corner-to-corner to select every colored bead in that range.</span><b>{moveSelection.size.toLocaleString()} selected</b><div><button type="button" className="secondary-button" onClick={() => setMoveSelection(new Set(draft.cells.flatMap((code, index) => code ? [index] : [])))} disabled={!draft.cells.some(Boolean)}>Select all</button><button type="button" className="secondary-button" onClick={() => setMoveSelection(new Set())} disabled={!moveSelection.size}>Clear</button><button type="button" className="primary-button move-selection-apply" onClick={openMove} disabled={!moveSelection.size}>Move selected</button></div></div> : <><div className="tool-grid">{([['brush','Brush'],['bucket','Bucket'],['eraser','Eraser'],['eyedropper','Eyedropper'],['replace','Replace all']] as Array<[EditorTool,string]>).map(([id, label]) => <button type="button" key={id} className={`${tool === id ? "active" : ""} ${id === "replace" ? "replace-tool" : ""}`} aria-pressed={tool === id} onClick={() => { setTool(id); setMoveSelection(new Set()); }}><ToolIcon tool={id} /><b>{label}</b></button>)}</div>
-        <button type="button" className="selected-color-button" onClick={() => setColorOpen(true)}><i className={selectedColor.transparent ? "transparent-swatch" : ""} style={{ background: selectedColor.transparent ? undefined : selectedColor.hex }} /><span><small>{tool === "replace" ? "Replacement color" : "Paint color"}</small><b>{selectedColor.code}</b></span><em>Choose →</em></button><p className="tool-help">{tool === "brush" ? "Tap to paint one bead, or drag with a mouse, pen, or finger to draw a continuous line. Pinch with two fingers to zoom and pan." : tool === "bucket" ? "Fill a connected section with the selected color." : tool === "eraser" ? "Tap to remove one bead, or drag with a mouse, pen, or finger to erase continuously." : tool === "replace" ? "Choose the replacement color, then tap any bead to change every bead of that color." : "Tap a bead or open the original upload to sample a color."}</p></>}
+        {moveSelecting ? <div className="move-selection-panel"><strong>Select beads to move</strong><span>With touch, swipe immediately to scroll. Press briefly until the board highlights, then drag corner-to-corner to select a range.</span><b>{moveSelection.size.toLocaleString()} selected</b><div><button type="button" className="secondary-button" onClick={() => setMoveSelection(new Set(draft.cells.flatMap((code, index) => code ? [index] : [])))} disabled={!draft.cells.some(Boolean)}>Select all</button><button type="button" className="secondary-button" onClick={() => setMoveSelection(new Set())} disabled={!moveSelection.size}>Clear</button><button type="button" className="primary-button move-selection-apply" onClick={openMove} disabled={!moveSelection.size}>Move selected</button></div></div> : <><div className="tool-grid">{([['brush','Brush'],['bucket','Bucket'],['eraser','Eraser'],['eyedropper','Eyedropper'],['replace','Replace all']] as Array<[EditorTool,string]>).map(([id, label]) => <button type="button" key={id} className={`${tool === id ? "active" : ""} ${id === "replace" ? "replace-tool" : ""}`} aria-pressed={tool === id} onClick={() => { setTool(id); setMoveSelection(new Set()); }}><ToolIcon tool={id} /><b>{label}</b></button>)}</div>
+        <button type="button" className="selected-color-button" onClick={() => setColorOpen(true)}><i className={selectedColor.transparent ? "transparent-swatch" : ""} style={{ background: selectedColor.transparent ? undefined : selectedColor.hex }} /><span><small>{tool === "replace" ? "Replacement color" : "Paint color"}</small><b>{selectedColor.code}</b></span><em>Choose →</em></button><p className="tool-help">{tool === "brush" ? "Mouse or pen: tap or drag to paint. Touch: swipe immediately to scroll, or press briefly until the board highlights and then drag to paint." : tool === "bucket" ? "Fill a connected section with the selected color." : tool === "eraser" ? "Mouse or pen: tap or drag to erase. Touch: swipe immediately to scroll, or press briefly until the board highlights and then drag to erase." : tool === "replace" ? "Choose the replacement color, then tap any bead to change every bead of that color." : "Tap a bead or open the original upload to sample a color."}</p></>}
       </aside>
     </div>
     <section className="used-colors"><div><strong>Colors used</strong><span>{draft.cells.filter(Boolean).length.toLocaleString()} beads · {usedColors.length} {usedColors.length === 1 ? "color" : "colors"}</span></div><div className="used-color-list">{usedColors.length ? usedColors.map((color) => <span key={color.code}><i className={color.transparent ? "transparent-swatch" : ""} style={{ background: color.transparent ? undefined : color.hex }} /><b>{color.code}</b><em>{counts[color.code]}</em></span>) : <p>No colors used yet. Choose a color and start drawing.</p>}</div></section>
