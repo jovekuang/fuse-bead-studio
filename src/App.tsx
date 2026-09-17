@@ -12,7 +12,7 @@ type Inventory = { code: string; name: string; hex: string; quantity: number; lo
 type StockTransaction = { id: string; type: "refill" | "use" | "adjustment"; label: string; changes: Record<string, number>; createdAt: string };
 type Draft = { id?: string; title: string; sourceKind: UploadMode; sourceFile?: File; sourceUrl: string; width: number; height: number; cells: Array<string | null> };
 type OcrWord = { text: string; left: number; top: number; width: number; height: number; confidence: number };
-const NAV_LABELS: Record<View, string> = { home: "Home", upload: "Upload", gallery: "Gallery", inventory: "Inventory" };
+const NAV_LABELS: Record<View, string> = { home: "Home", upload: "Create", gallery: "Gallery", inventory: "Inventory" };
 const MAX_UPLOAD_BYTES = 25 * 1024 * 1024;
 const SERIES = [...new Set(PALETTE.map((color) => color.code[0]))];
 const SERIES_NAMES: Record<string, string> = {
