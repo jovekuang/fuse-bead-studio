@@ -56,17 +56,40 @@ function resizeDraft(draft: Draft, width: number, height: number): { draft: Draf
   return { draft: cropped ? null : { ...draft, width, height, cells }, cropped };
 }
 
-function moveDraft(draft: Draft, columnOffset: number, rowOffset: number): { draft: Draft | null; cropped: number } {
-  const cells: Draft["cells"] = Array(draft.width * draft.height).fill(null);
-  let cropped = 0;
-  draft.cells.forEach((code, index) => {
-    if (!code) return;
+function moveSelectedDraft(draft: Draft, selection: Set<number>, columnOffset: number, rowOffset: number): { draft: Draft | null; cropped: number; blocked: number } {
+  const selected = [...selection].filter((index) => Boolean(draft.cells[index]));
+  const cells = [...draft.cells];
+  let cropped = 0; let blocked = 0;
+  for (const index of selected) {
     const x = index % draft.width + columnOffset;
     const y = Math.floor(index / draft.width) + rowOffset;
-    if (x < 0 || x >= draft.width || y < 0 || y >= draft.height) cropped += 1;
-    else cells[y * draft.width + x] = code;
-  });
-  return { draft: cropped ? null : { ...draft, cells }, cropped };
+    if (x < 0 || x >= draft.width || y < 0 || y >= draft.height) { cropped += 1; continue; }
+    const destination = y * draft.width + x;
+    if (draft.cells[destination] && !selection.has(destination)) blocked += 1;
+  }
+  if (cropped || blocked || !selected.length) return { draft: null, cropped, blocked };
+  for (const index of selected) cells[index] = null;
+  for (const index of selected) {
+    const destination = (Math.floor(index / draft.width) + rowOffset) * draft.width + index % draft.width + columnOffset;
+    cells[destination] = draft.cells[index];
+  }
+  return { draft: { ...draft, cells }, cropped: 0, blocked: 0 };
+}
+
+function lineCellIndices(from: number, to: number, width: number): number[] {
+  let x0 = from % width; let y0 = Math.floor(from / width);
+  const x1 = to % width; const y1 = Math.floor(to / width);
+  const dx = Math.abs(x1 - x0); const sx = x0 < x1 ? 1 : -1;
+  const dy = -Math.abs(y1 - y0); const sy = y0 < y1 ? 1 : -1;
+  let error = dx + dy; const indices: number[] = [];
+  while (true) {
+    indices.push(y0 * width + x0);
+    if (x0 === x1 && y0 === y1) break;
+    const doubled = error * 2;
+    if (doubled >= dy) { error += dy; x0 += sx; }
+    if (doubled <= dx) { error += dx; y0 += sy; }
+  }
+  return indices;
 }
 
 const paletteByCode = new Map<string, (typeof PALETTE)[number]>(PALETTE.map((color) => [color.code, color]));
@@ -808,23 +831,49 @@ async function existingTemplateToGrid(file: File, progress: (message: string) =>
   return { sourceUrl, width, height, cells, labelsRead: recognized.size, occupied: occupied.length };
 }
 
-function BeadGrid({ draft, onPaint, compact = false, dragEnabled = true, zoom = 100, showEmptyMark = true, majorGrid = false }: { draft: Draft; onPaint?: (index: number) => void; compact?: boolean; dragEnabled?: boolean; zoom?: number; showEmptyMark?: boolean; majorGrid?: boolean }) {
-  const painting = useRef(false);
-  const touchStart = useRef<{ index: number; x: number; y: number } | null>(null);
+function BeadGrid({ draft, onPaint, compact = false, dragEnabled = true, zoom = 100, showEmptyMark = true, majorGrid = false, selectedIndices, selectionMode = false }: { draft: Draft; onPaint?: (indices: number[]) => void; compact?: boolean; dragEnabled?: boolean; zoom?: number; showEmptyMark?: boolean; majorGrid?: boolean; selectedIndices?: Set<number>; selectionMode?: boolean }) {
+  const gesture = useRef<{ pointerId: number; pointerType: string; startIndex: number; lastIndex: number; x: number; y: number; drawing: boolean } | null>(null);
+  const activeTouches = useRef(new Set<number>());
   const cellSize = compact ? 5 : Math.max(majorGrid ? 1 : 6, Math.round(22 * zoom / 100));
-  return <div className={`bead-grid ${onPaint ? "editable" : ""} ${compact ? "compact-grid" : ""} ${majorGrid && cellSize < 12 ? "fine-grid" : ""}`} style={{ gridTemplateColumns: `repeat(${draft.width}, ${cellSize}px)` }} onPointerLeave={(event) => { if (event.pointerType !== "touch") painting.current = false; }} onPointerMove={(event) => {
+  const cellFromPoint = (x: number, y: number, grid: HTMLDivElement) => {
+    const target = document.elementFromPoint(x, y)?.closest<HTMLElement>("[data-cell-index]");
+    return target && grid.contains(target) ? Number(target.dataset.cellIndex) : null;
+  };
+  const finishGesture = (event: PointerEvent<HTMLDivElement>, cancelled = false) => {
+    if (event.pointerType === "touch") activeTouches.current.delete(event.pointerId);
+    const current = gesture.current;
+    if (!current || current.pointerId !== event.pointerId) return;
+    if (!cancelled && current.pointerType === "touch" && !current.drawing) onPaint?.([current.startIndex]);
+    gesture.current = null;
+  };
+  return <div className={`bead-grid ${onPaint ? "editable" : ""} ${dragEnabled && onPaint ? "continuous-draw" : ""} ${selectionMode ? "selection-mode" : ""} ${compact ? "compact-grid" : ""} ${majorGrid && cellSize < 12 ? "fine-grid" : ""}`} style={{ gridTemplateColumns: `repeat(${draft.width}, ${cellSize}px)` }} onPointerDown={(event) => {
+    if (!onPaint || event.button !== 0) return;
+    const index = cellFromPoint(event.clientX, event.clientY, event.currentTarget); if (index === null) return;
     if (event.pointerType === "touch") {
-      if (touchStart.current && Math.hypot(event.clientX - touchStart.current.x, event.clientY - touchStart.current.y) > 8) touchStart.current = null;
-      return;
+      activeTouches.current.add(event.pointerId);
+      if (activeTouches.current.size > 1) { gesture.current = null; return; }
     }
-    if (painting.current && dragEnabled && onPaint) { const target = document.elementFromPoint(event.clientX, event.clientY)?.closest<HTMLElement>("[data-cell-index]"); if (target && event.currentTarget.contains(target)) onPaint(Number(target.dataset.cellIndex)); }
-  }} onPointerUp={() => { painting.current = false; }} onPointerCancel={() => { painting.current = false; touchStart.current = null; }}>
+    gesture.current = { pointerId: event.pointerId, pointerType: event.pointerType, startIndex: index, lastIndex: index, x: event.clientX, y: event.clientY, drawing: event.pointerType !== "touch" };
+    event.currentTarget.setPointerCapture(event.pointerId);
+    if (event.pointerType !== "touch") onPaint([index]);
+  }} onPointerMove={(event) => {
+    const current = gesture.current;
+    if (!current || current.pointerId !== event.pointerId || !dragEnabled || !onPaint || activeTouches.current.size > 1) return;
+    const index = cellFromPoint(event.clientX, event.clientY, event.currentTarget); if (index === null) return;
+    if (current.pointerType === "touch" && !current.drawing) {
+      if (Math.hypot(event.clientX - current.x, event.clientY - current.y) < 5) return;
+      current.drawing = true;
+      const indices = lineCellIndices(current.startIndex, index, draft.width); onPaint(indices); current.lastIndex = index; return;
+    }
+    if (index === current.lastIndex) return;
+    const indices = lineCellIndices(current.lastIndex, index, draft.width).slice(1);
+    if (indices.length) onPaint(indices);
+    current.lastIndex = index;
+  }} onPointerUp={(event) => finishGesture(event)} onPointerCancel={(event) => finishGesture(event, true)}>
     {draft.cells.map((code, index) => {
       const color = code ? paletteByCode.get(code) : undefined;
       return <button key={index} type="button" data-cell-index={index} aria-label={`Cell ${index + 1}: ${color?.name ?? "empty"}`} title={`${index % draft.width + 1}, ${Math.floor(index / draft.width) + 1}: ${color?.name ?? "empty"}`} disabled={!onPaint}
-        className={`bead-cell ${color?.transparent ? "transparent-bead" : ""} ${majorGrid && (index % draft.width + 1) % 10 === 0 ? "major-column" : ""} ${majorGrid && (Math.floor(index / draft.width) + 1) % 10 === 0 ? "major-row" : ""}`} style={{ width: cellSize, height: cellSize, fontSize: compact || (majorGrid && cellSize < 7) ? 0 : Math.max(5, Math.round(7 * zoom / 100)), background: color?.transparent ? undefined : color?.hex ?? "transparent", color: color ? labelColor(color.hex) : "#6e645d" }}
-        onPointerDown={(event: PointerEvent) => { if (event.pointerType === "touch") { touchStart.current = { index, x: event.clientX, y: event.clientY }; return; } painting.current = true; onPaint?.(index); }}
-        onPointerEnter={(event) => { if (event.pointerType !== "touch" && painting.current && dragEnabled) onPaint?.(index); }} onPointerUp={(event) => { if (event.pointerType === "touch" && touchStart.current?.index === index) onPaint?.(index); touchStart.current = null; painting.current = false; }}>{code ?? (showEmptyMark ? "×" : "")}</button>;
+        className={`bead-cell ${selectedIndices?.has(index) ? "selected-for-move" : ""} ${color?.transparent ? "transparent-bead" : ""} ${majorGrid && (index % draft.width + 1) % 10 === 0 ? "major-column" : ""} ${majorGrid && (Math.floor(index / draft.width) + 1) % 10 === 0 ? "major-row" : ""}`} style={{ width: cellSize, height: cellSize, fontSize: compact || (majorGrid && cellSize < 7) ? 0 : Math.max(5, Math.round(7 * zoom / 100)), background: color?.transparent ? undefined : color?.hex ?? "transparent", color: color ? labelColor(color.hex) : "#6e645d" }}>{code ?? (showEmptyMark ? "×" : "")}</button>;
     })}
   </div>;
 }
@@ -988,6 +1037,8 @@ function TemplateEditor({ draft, setDraft, onSave, onCancel, busy }: { draft: Dr
   const [resizeOpen, setResizeOpen] = useState(false);
   const [resizeWidthInput, setResizeWidthInput] = useState(String(draft.width));
   const [resizeHeightInput, setResizeHeightInput] = useState(String(draft.height));
+  const [moveSelecting, setMoveSelecting] = useState(false);
+  const [moveSelection, setMoveSelection] = useState<Set<number>>(new Set());
   const [moveOpen, setMoveOpen] = useState(false);
   const [horizontalDirection, setHorizontalDirection] = useState<"left" | "right">("right");
   const [horizontalDistanceInput, setHorizontalDistanceInput] = useState("0");
@@ -995,7 +1046,7 @@ function TemplateEditor({ draft, setDraft, onSave, onCancel, busy }: { draft: Dr
   const [verticalDistanceInput, setVerticalDistanceInput] = useState("0");
   const gridScrollRef = useRef<HTMLDivElement>(null);
   const pinchPointers = useRef(new Map<number, { x: number; y: number }>());
-  const pinchStart = useRef<{ distance: number; zoom: number } | null>(null);
+  const pinchStart = useRef<{ distance: number; zoom: number; centerX: number; centerY: number; scrollLeft: number; scrollTop: number } | null>(null);
   const counts = useMemo(() => countBeads(draft.cells), [draft.cells]);
   const smallDraft = useMemo(() => draft.width === 26 && draft.height === 26 ? null : fitArtworkToSmall(draft), [draft]);
   const resizeWidth = Number(resizeWidthInput); const resizeHeight = Number(resizeHeightInput);
@@ -1005,7 +1056,7 @@ function TemplateEditor({ draft, setDraft, onSave, onCancel, busy }: { draft: Dr
   const moveInputsValid = Number.isInteger(horizontalDistance) && horizontalDistance >= 0 && horizontalDistance < draft.width && Number.isInteger(verticalDistance) && verticalDistance >= 0 && verticalDistance < draft.height;
   const moveColumns = (horizontalDirection === "left" ? -1 : 1) * (moveInputsValid ? horizontalDistance : 0);
   const moveRows = (verticalDirection === "up" ? -1 : 1) * (moveInputsValid ? verticalDistance : 0);
-  const moveResult = useMemo(() => moveInputsValid ? moveDraft(draft, moveColumns, moveRows) : { draft: null, cropped: 0 }, [draft, moveColumns, moveRows, moveInputsValid]);
+  const moveResult = useMemo(() => moveInputsValid ? moveSelectedDraft(draft, moveSelection, moveColumns, moveRows) : { draft: null, cropped: 0, blocked: 0 }, [draft, moveSelection, moveColumns, moveRows, moveInputsValid]);
   const visibleColors = PALETTE.filter((color) => color.code.startsWith(colorSeries) && (color.code.toLowerCase().includes(paletteSearch.toLowerCase()) || color.name.toLowerCase().includes(paletteSearch.toLowerCase())));
   const usedColors = PALETTE.filter((color) => counts[color.code]);
   const commitDraft = (next: Draft) => { setHistory((current) => [...current.slice(-49), draft]); setDraft(next); };
@@ -1013,7 +1064,8 @@ function TemplateEditor({ draft, setDraft, onSave, onCancel, busy }: { draft: Dr
     const previous = current.at(-1); if (!previous) return current;
     setDraft(previous); return current.slice(0, -1);
   });
-  const applyTool = (index: number) => {
+  const applyTool = (indices: number[]) => {
+    const index = indices[0]; if (index === undefined) return;
     const current = draft.cells[index];
     if (tool === "eyedropper") { if (current) { setSelected(current); setColorSeries(current[0]); setTool("brush"); } return; }
     if (tool === "replace") {
@@ -1022,9 +1074,13 @@ function TemplateEditor({ draft, setDraft, onSave, onCancel, busy }: { draft: Dr
       return;
     }
     const replacement = tool === "eraser" ? null : selected;
-    if (current === replacement) return;
     const cells = [...draft.cells];
-    if (tool !== "bucket") cells[index] = replacement;
+    if (tool === "bucket" && current === replacement) return;
+    if (tool !== "bucket") {
+      let changed = false;
+      for (const next of indices) if (cells[next] !== replacement) { cells[next] = replacement; changed = true; }
+      if (!changed) return;
+    }
     else {
       const queue = [index]; const visited = new Set<number>();
       while (queue.length) {
@@ -1037,11 +1093,20 @@ function TemplateEditor({ draft, setDraft, onSave, onCancel, busy }: { draft: Dr
     }
     commitDraft({ ...draft, cells });
   };
+  const updateMoveSelection = (indices: number[]) => setMoveSelection((current) => {
+    const next = new Set(current);
+    for (const index of indices) {
+      if (!draft.cells[index]) continue;
+      if (next.has(index)) next.delete(index); else next.add(index);
+    }
+    return next;
+  });
   const selectedColor = paletteByCode.get(selected)!;
   const chooseColor = (code: string) => { setSelected(code); setColorSeries(code[0]); setColorOpen(false); };
-  const openResize = () => { setResizeWidthInput(String(draft.width)); setResizeHeightInput(String(draft.height)); setResizeOpen(true); };
+  const openResize = () => { setMoveSelecting(false); setMoveSelection(new Set()); setResizeWidthInput(String(draft.width)); setResizeHeightInput(String(draft.height)); setResizeOpen(true); };
   const setHorizontalOffset = (offset: number) => { const limited = Math.max(1 - draft.width, Math.min(draft.width - 1, offset)); setHorizontalDirection(limited < 0 ? "left" : "right"); setHorizontalDistanceInput(String(Math.abs(limited))); };
   const setVerticalOffset = (offset: number) => { const limited = Math.max(1 - draft.height, Math.min(draft.height - 1, offset)); setVerticalDirection(limited < 0 ? "up" : "down"); setVerticalDistanceInput(String(Math.abs(limited))); };
+  const startMoveSelection = () => { setMoveOpen(false); setMoveSelection(new Set()); setMoveSelecting(true); };
   const openMove = () => { setHorizontalDirection("right"); setHorizontalDistanceInput("0"); setVerticalDirection("down"); setVerticalDistanceInput("0"); setMoveOpen(true); };
   const fitGrid = () => {
     const viewport = gridScrollRef.current; if (!viewport) return;
@@ -1055,7 +1120,8 @@ function TemplateEditor({ draft, setDraft, onSave, onCancel, busy }: { draft: Dr
     pinchPointers.current.set(event.pointerId, { x: event.clientX, y: event.clientY });
     if (pinchPointers.current.size === 2) {
       const [first, second] = [...pinchPointers.current.values()];
-      pinchStart.current = { distance: Math.hypot(second.x - first.x, second.y - first.y), zoom };
+      const viewport = gridScrollRef.current;
+      pinchStart.current = { distance: Math.hypot(second.x - first.x, second.y - first.y), zoom, centerX: (first.x + second.x) / 2, centerY: (first.y + second.y) / 2, scrollLeft: viewport?.scrollLeft ?? 0, scrollTop: viewport?.scrollTop ?? 0 };
     }
   };
   const moveGridGesture = (event: PointerEvent<HTMLDivElement>) => {
@@ -1066,6 +1132,10 @@ function TemplateEditor({ draft, setDraft, onSave, onCancel, busy }: { draft: Dr
     const distance = Math.hypot(second.x - first.x, second.y - first.y);
     const nextZoom = Math.round(pinchStart.current.zoom * distance / Math.max(1, pinchStart.current.distance));
     setZoom(Math.max(25, Math.min(200, nextZoom)));
+    if (gridScrollRef.current) {
+      gridScrollRef.current.scrollLeft = pinchStart.current.scrollLeft - ((first.x + second.x) / 2 - pinchStart.current.centerX);
+      gridScrollRef.current.scrollTop = pinchStart.current.scrollTop - ((first.y + second.y) / 2 - pinchStart.current.centerY);
+    }
   };
   const endGridGesture = (event: PointerEvent<HTMLDivElement>) => { pinchPointers.current.delete(event.pointerId); if (pinchPointers.current.size < 2) pinchStart.current = null; };
   const sampleSourceImage = (event: ReactMouseEvent<HTMLImageElement>) => {
@@ -1084,22 +1154,22 @@ function TemplateEditor({ draft, setDraft, onSave, onCancel, busy }: { draft: Dr
     <div className="editor-workspace">
       <section className="comparison-pane template-pane">
         <div className="pane-heading"><strong>Edit Template</strong><div className="zoom-controls" aria-label="Template zoom controls"><button type="button" onClick={() => setZoom((value) => Math.max(25, value - 25))} disabled={zoom === 25} aria-label="Zoom out">−</button><input type="range" min="25" max="200" step="25" value={zoom} onChange={(event) => setZoom(Number(event.target.value))} aria-label="Zoom level" /><span>{zoom}%</span><button type="button" onClick={() => setZoom((value) => Math.min(200, value + 25))} disabled={zoom === 200} aria-label="Zoom in">+</button><button type="button" className="fit-button" onClick={fitGrid}>Fit</button></div><span>{draft.width} × {draft.height}</span></div>
-        <div ref={gridScrollRef} className="grid-scroll" onPointerDown={beginGridGesture} onPointerMove={moveGridGesture} onPointerUp={endGridGesture} onPointerCancel={endGridGesture}><BeadGrid draft={draft} onPaint={applyTool} dragEnabled={tool === "brush" || tool === "eraser"} zoom={zoom} /></div>
+        <div ref={gridScrollRef} className="grid-scroll" onPointerDown={beginGridGesture} onPointerMove={moveGridGesture} onPointerUp={endGridGesture} onPointerCancel={endGridGesture}><BeadGrid draft={draft} onPaint={moveSelecting ? updateMoveSelection : applyTool} dragEnabled={moveSelecting || tool === "brush" || tool === "eraser"} zoom={zoom} selectedIndices={moveSelection} selectionMode={moveSelecting} /></div>
       </section>
       <aside className="editor-tools">
         <div className="tools-heading"><strong>Editing tools</strong></div>
         <div className="editor-utility-tools">
           <button type="button" onClick={undo} disabled={!history.length} title="Undo the last template change" aria-label="Undo last action"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 7 4 12l5 5"/><path d="M5 12h8a6 6 0 0 1 6 6"/></svg><b>Undo</b></button>
           <button type="button" onClick={openResize} title="Change the board dimensions"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 4H4v5M15 20h5v-5M4 9l6-6M20 15l-6 6"/></svg><b>Resize</b></button>
-          <button type="button" onClick={openMove} title="Shift all drawn beads together"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v18M3 12h18M12 3l-3 3M12 3l3 3M21 12l-3-3M21 12l-3 3M12 21l-3-3M12 21l3-3M3 12l3-3M3 12l3 3"/></svg><b>Move</b></button>
+          <button type="button" className={moveSelecting ? "active" : ""} onClick={() => moveSelecting ? (setMoveSelecting(false), setMoveSelection(new Set())) : startMoveSelection()} title="Select and move a group of beads" aria-pressed={moveSelecting}><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v18M3 12h18M12 3l-3 3M12 3l3 3M21 12l-3-3M21 12l-3 3M12 21l-3-3M12 21l3-3M3 12l3-3M3 12l3 3"/></svg><b>Move</b></button>
         </div>
-        <div className="tool-grid">{([['brush','Brush'],['bucket','Bucket'],['eraser','Eraser'],['eyedropper','Eyedropper'],['replace','Replace all']] as Array<[EditorTool,string]>).map(([id, label]) => <button type="button" key={id} className={`${tool === id ? "active" : ""} ${id === "replace" ? "replace-tool" : ""}`} aria-pressed={tool === id} onClick={() => setTool(id)}><ToolIcon tool={id} /><b>{label}</b></button>)}</div>
-        <button type="button" className="selected-color-button" onClick={() => setColorOpen(true)}><i className={selectedColor.transparent ? "transparent-swatch" : ""} style={{ background: selectedColor.transparent ? undefined : selectedColor.hex }} /><span><small>{tool === "replace" ? "Replacement color" : "Paint color"}</small><b>{selectedColor.code}</b></span><em>Choose →</em></button><p className="tool-help">{tool === "brush" ? "Tap or click to paint. Drag with a mouse to paint continuously; drag on a touchscreen to scroll." : tool === "bucket" ? "Fill a connected section with the selected color." : tool === "eraser" ? "Tap or click to remove a bead. Drag with a mouse to erase continuously; drag on a touchscreen to scroll." : tool === "replace" ? "Choose the replacement color, then tap any bead to change every bead of that color." : "Tap a bead or open the original upload to sample a color."}</p>
+        {moveSelecting ? <div className="move-selection-panel"><strong>Select beads to move</strong><span>Tap or drag across colored cells. Selected beads are outlined.</span><b>{moveSelection.size.toLocaleString()} selected</b><div><button type="button" className="secondary-button" onClick={() => setMoveSelection(new Set())} disabled={!moveSelection.size}>Clear</button><button type="button" className="primary-button" onClick={openMove} disabled={!moveSelection.size}>Move selected</button></div></div> : <><div className="tool-grid">{([['brush','Brush'],['bucket','Bucket'],['eraser','Eraser'],['eyedropper','Eyedropper'],['replace','Replace all']] as Array<[EditorTool,string]>).map(([id, label]) => <button type="button" key={id} className={`${tool === id ? "active" : ""} ${id === "replace" ? "replace-tool" : ""}`} aria-pressed={tool === id} onClick={() => { setTool(id); setMoveSelection(new Set()); }}><ToolIcon tool={id} /><b>{label}</b></button>)}</div>
+        <button type="button" className="selected-color-button" onClick={() => setColorOpen(true)}><i className={selectedColor.transparent ? "transparent-swatch" : ""} style={{ background: selectedColor.transparent ? undefined : selectedColor.hex }} /><span><small>{tool === "replace" ? "Replacement color" : "Paint color"}</small><b>{selectedColor.code}</b></span><em>Choose →</em></button><p className="tool-help">{tool === "brush" ? "Tap to paint one bead, or drag with a mouse, pen, or finger to draw a continuous line. Pinch with two fingers to zoom and pan." : tool === "bucket" ? "Fill a connected section with the selected color." : tool === "eraser" ? "Tap to remove one bead, or drag with a mouse, pen, or finger to erase continuously." : tool === "replace" ? "Choose the replacement color, then tap any bead to change every bead of that color." : "Tap a bead or open the original upload to sample a color."}</p></>}
       </aside>
     </div>
     <section className="used-colors"><div><strong>Colors used</strong><span>{draft.cells.filter(Boolean).length.toLocaleString()} beads · {usedColors.length} {usedColors.length === 1 ? "color" : "colors"}</span></div><div className="used-color-list">{usedColors.length ? usedColors.map((color) => <span key={color.code}><i className={color.transparent ? "transparent-swatch" : ""} style={{ background: color.transparent ? undefined : color.hex }} /><b>{color.code}</b><em>{counts[color.code]}</em></span>) : <p>No colors used yet. Choose a color and start drawing.</p>}</div></section>
     {resizeOpen && <div className="gallery-modal-backdrop" onClick={(event) => { if (event.target === event.currentTarget) setResizeOpen(false); }}><section className="gallery-modal resize-template-modal" role="dialog" aria-modal="true" aria-label="Resize template"><header><div><p className="eyebrow">Template tool</p><h2>Resize template</h2><p>Change the board dimensions. Existing beads keep their current row and column.</p></div><button type="button" aria-label="Close resize template" onClick={() => setResizeOpen(false)}>×</button></header>{smallDraft && <div className="resize-shortcut"><div><strong>Fit artwork to Small</strong><span>Trim empty outer space and center every drawn bead on a 26 × 26 board.</span></div><button type="button" className="fit-small-button" onClick={() => { commitDraft(smallDraft); setResizeOpen(false); }}>Fit to 26 × 26</button></div>}<div className="resize-fields"><label>Width<input aria-label="Width" type="number" min="4" max="128" value={resizeWidthInput} onChange={(event) => setResizeWidthInput(event.target.value)} /></label><span>×</span><label>Height<input aria-label="Height" type="number" min="4" max="128" value={resizeHeightInput} onChange={(event) => setResizeHeightInput(event.target.value)} /></label></div><div className={`resize-status ${!resizeInputsValid || resizeResult.cropped ? "warning" : ""}`}>{!resizeInputsValid ? "Enter a complete width and height from 4 to 128." : resizeResult.cropped ? `This size would cut off ${resizeResult.cropped.toLocaleString()} drawn ${resizeResult.cropped === 1 ? "bead" : "beads"}. Increase the dimensions before applying.` : <><strong>All drawn beads will be preserved</strong><span>{draft.width} × {draft.height} becomes {resizeWidth} × {resizeHeight}</span></>}</div><div className="button-row resize-actions"><button type="button" className="secondary-button" onClick={() => setResizeOpen(false)}>Cancel</button><button type="button" className="primary-button" disabled={!resizeInputsValid || !resizeResult.draft || (resizeWidth === draft.width && resizeHeight === draft.height)} onClick={() => { if (resizeResult.draft) commitDraft(resizeResult.draft); setResizeOpen(false); }}>Apply resize</button></div></section></div>}
-    {moveOpen && <div className="gallery-modal-backdrop" onClick={(event) => { if (event.target === event.currentTarget) setMoveOpen(false); }}><section className="gallery-modal resize-template-modal move-template-modal" role="dialog" aria-modal="true" aria-label="Move beads"><header><div><p className="eyebrow">Template tool</p><h2>Move beads</h2><p>Shift every drawn bead together without changing the board size.</p></div><button type="button" aria-label="Close move beads" onClick={() => setMoveOpen(false)}>×</button></header><div className="move-fields"><label>Horizontal<div className="move-direction-input"><select aria-label="Horizontal direction" value={horizontalDirection} onChange={(event) => setHorizontalDirection(event.target.value as "left" | "right")}><option value="left">Left</option><option value="right">Right</option></select><input aria-label="Horizontal distance" inputMode="numeric" type="number" min="0" max={draft.width - 1} value={horizontalDistanceInput} onChange={(event) => setHorizontalDistanceInput(event.target.value)} /><span>cells</span></div></label><label>Vertical<div className="move-direction-input"><select aria-label="Vertical direction" value={verticalDirection} onChange={(event) => setVerticalDirection(event.target.value as "up" | "down")}><option value="up">Up</option><option value="down">Down</option></select><input aria-label="Vertical distance" inputMode="numeric" type="number" min="0" max={draft.height - 1} value={verticalDistanceInput} onChange={(event) => setVerticalDistanceInput(event.target.value)} /><span>cells</span></div></label></div><div className="move-stepper" aria-label="Move beads one cell"><span /><button type="button" aria-label="Move up one row" onClick={() => setVerticalOffset(moveRows - 1)}>↑</button><span /><button type="button" aria-label="Move left one column" onClick={() => setHorizontalOffset(moveColumns - 1)}>←</button><button type="button" aria-label="Reset move" onClick={() => { setHorizontalDirection("right"); setHorizontalDistanceInput("0"); setVerticalDirection("down"); setVerticalDistanceInput("0"); }}>•</button><button type="button" aria-label="Move right one column" onClick={() => setHorizontalOffset(moveColumns + 1)}>→</button><span /><button type="button" aria-label="Move down one row" onClick={() => setVerticalOffset(moveRows + 1)}>↓</button></div><div className={`resize-status ${!moveInputsValid || moveResult.cropped ? "warning" : ""}`}>{!moveInputsValid ? `Enter horizontal and vertical distances within this ${draft.width} × ${draft.height} board.` : moveResult.cropped ? `This move would push ${moveResult.cropped.toLocaleString()} drawn ${moveResult.cropped === 1 ? "bead" : "beads"} outside the board. Choose a smaller distance or resize the board first.` : <><strong>All drawn beads will stay on the board</strong><span>{moveColumns === 0 && moveRows === 0 ? "Choose how far to move the beads" : `${horizontalDistance || "No"} ${horizontalDistance === 1 ? "cell" : "cells"}${horizontalDistance ? ` ${horizontalDirection}` : " horizontally"}; ${verticalDistance || "no"} ${verticalDistance === 1 ? "cell" : "cells"}${verticalDistance ? ` ${verticalDirection}` : " vertically"}`}</span></>}</div><div className="button-row resize-actions"><button type="button" className="secondary-button" onClick={() => setMoveOpen(false)}>Cancel</button><button type="button" className="primary-button" disabled={!moveInputsValid || !moveResult.draft || (moveColumns === 0 && moveRows === 0)} onClick={() => { if (moveResult.draft) commitDraft(moveResult.draft); setMoveOpen(false); }}>Apply move</button></div></section></div>}
+    {moveOpen && <div className="gallery-modal-backdrop" onClick={(event) => { if (event.target === event.currentTarget) setMoveOpen(false); }}><section className="gallery-modal resize-template-modal move-template-modal" role="dialog" aria-modal="true" aria-label="Move selected beads"><header><div><p className="eyebrow">Template tool</p><h2>Move selected beads</h2><p>Shift the {moveSelection.size.toLocaleString()} selected {moveSelection.size === 1 ? "bead" : "beads"} without changing the board size.</p></div><button type="button" aria-label="Close move selected beads" onClick={() => setMoveOpen(false)}>×</button></header><div className="move-fields"><label>Horizontal<div className="move-direction-input"><select aria-label="Horizontal direction" value={horizontalDirection} onChange={(event) => setHorizontalDirection(event.target.value as "left" | "right")}><option value="left">Left</option><option value="right">Right</option></select><input aria-label="Horizontal distance" inputMode="numeric" type="number" min="0" max={draft.width - 1} value={horizontalDistanceInput} onChange={(event) => setHorizontalDistanceInput(event.target.value)} /><span>cells</span></div></label><label>Vertical<div className="move-direction-input"><select aria-label="Vertical direction" value={verticalDirection} onChange={(event) => setVerticalDirection(event.target.value as "up" | "down")}><option value="up">Up</option><option value="down">Down</option></select><input aria-label="Vertical distance" inputMode="numeric" type="number" min="0" max={draft.height - 1} value={verticalDistanceInput} onChange={(event) => setVerticalDistanceInput(event.target.value)} /><span>cells</span></div></label></div><div className="move-stepper" aria-label="Move selected beads one cell"><span /><button type="button" aria-label="Move up one row" onClick={() => setVerticalOffset(moveRows - 1)}>↑</button><span /><button type="button" aria-label="Move left one column" onClick={() => setHorizontalOffset(moveColumns - 1)}>←</button><button type="button" aria-label="Reset move" onClick={() => { setHorizontalDirection("right"); setHorizontalDistanceInput("0"); setVerticalDirection("down"); setVerticalDistanceInput("0"); }}>•</button><button type="button" aria-label="Move right one column" onClick={() => setHorizontalOffset(moveColumns + 1)}>→</button><span /><button type="button" aria-label="Move down one row" onClick={() => setVerticalOffset(moveRows + 1)}>↓</button></div><div className={`resize-status ${!moveInputsValid || moveResult.cropped || moveResult.blocked ? "warning" : ""}`}>{!moveInputsValid ? `Enter horizontal and vertical distances within this ${draft.width} × ${draft.height} board.` : moveResult.cropped ? `This move would push ${moveResult.cropped.toLocaleString()} selected ${moveResult.cropped === 1 ? "bead" : "beads"} outside the board. Choose a smaller distance.` : moveResult.blocked ? `This move would overlap ${moveResult.blocked.toLocaleString()} unselected ${moveResult.blocked === 1 ? "bead" : "beads"}. Choose another offset.` : <><strong>Selected beads will stay on the board</strong><span>{moveColumns === 0 && moveRows === 0 ? "Choose how far to move the selection" : `${horizontalDistance || "No"} ${horizontalDistance === 1 ? "cell" : "cells"}${horizontalDistance ? ` ${horizontalDirection}` : " horizontally"}; ${verticalDistance || "no"} ${verticalDistance === 1 ? "cell" : "cells"}${verticalDistance ? ` ${verticalDirection}` : " vertically"}`}</span></>}</div><div className="button-row resize-actions"><button type="button" className="secondary-button" onClick={() => setMoveOpen(false)}>Cancel</button><button type="button" className="primary-button" disabled={!moveInputsValid || !moveResult.draft || (moveColumns === 0 && moveRows === 0)} onClick={() => { if (moveResult.draft) commitDraft(moveResult.draft); setMoveOpen(false); setMoveSelecting(false); setMoveSelection(new Set()); }}>Apply move</button></div></section></div>}
     {colorOpen && <div className="color-dialog-backdrop" onClick={(event) => { if (event.target === event.currentTarget) setColorOpen(false); }}><section className="color-dialog" role="dialog" aria-modal="true" aria-label="Choose a bead color"><header><div><p className="eyebrow">264-color palette</p><h2>Choose a color</h2></div><button type="button" aria-label="Close color selection" onClick={() => setColorOpen(false)}>×</button></header><input className="palette-search" value={paletteSearch} onChange={(event) => setPaletteSearch(event.target.value)} placeholder="Find a code or color" aria-label="Find a palette color" /><div className="series-tabs" role="tablist" aria-label="Color series">{SERIES.map((series) => { const colors = PALETTE.filter((color) => color.code.startsWith(series)); const swatches = colors.filter((_, index) => index % Math.max(1, Math.floor(colors.length / 6)) === 0).slice(0, 6); return <button type="button" role="tab" aria-selected={colorSeries === series} className={colorSeries === series ? "active" : ""} key={series} onClick={() => setColorSeries(series)}><span><b>{series}</b><small>{SERIES_NAMES[series]}</small></span><span className="color-series-swatches" aria-hidden="true">{swatches.map((color) => <i key={color.code} className={color.transparent ? "transparent-swatch" : ""} style={{ background: color.transparent ? undefined : color.hex }} />)}</span></button>; })}</div><div className="color-picker-grid">{visibleColors.map((color) => <button type="button" key={color.code} className={selected === color.code ? "active" : ""} onClick={() => chooseColor(color.code)}><i className={color.transparent ? "transparent-swatch" : ""} style={{ background: color.transparent ? undefined : color.hex }} /><b>{color.code}</b></button>)}{visibleColors.length === 0 && <p>No colors match your search in this series.</p>}</div></section></div>}
     {sourceOpen && <div className="source-image-backdrop" onClick={(event) => { if (event.target === event.currentTarget) setSourceOpen(false); }}><section className="source-image-dialog" role="dialog" aria-modal="true" aria-label="High-resolution original image"><header><div><p className="eyebrow">{tool === "eyedropper" ? "Sample from original" : "Original upload"}</p><h2>{draft.title}</h2>{tool === "eyedropper" && <p className="source-sample-help">Click a point in the image to select its closest bead color.</p>}</div><button type="button" aria-label="Close original image" onClick={() => setSourceOpen(false)}>×</button></header><img className={tool === "eyedropper" ? "sampling" : ""} onClick={tool === "eyedropper" ? sampleSourceImage : undefined} src={draft.sourceUrl} alt={`High-resolution original for ${draft.title}`} /></section></div>}
   </section>;
@@ -1130,7 +1200,11 @@ function App() {
   const [useTemplateSearch, setUseTemplateSearch] = useState(""); const [useTemplatePage, setUseTemplatePage] = useState(0);
   const [stockHistoryOpen, setStockHistoryOpen] = useState(false); const [stockTransactions, setStockTransactions] = useState<StockTransaction[]>([]); const [stockDeleteTarget, setStockDeleteTarget] = useState<StockTransaction | null>(null);
   const [viewerTemplate, setViewerTemplate] = useState<Template | null>(null);
-  const templateInput = useRef<HTMLInputElement>(null); const artworkInput = useRef<HTMLInputElement>(null);
+  const templateInput = useRef<HTMLInputElement>(null); const artworkInput = useRef<HTMLInputElement>(null); const featuredScroller = useRef<HTMLDivElement>(null);
+  const scrollFeatured = (direction: -1 | 1) => {
+    const scroller = featuredScroller.current; if (!scroller) return;
+    scroller.scrollBy({ left: direction * Math.max(280, scroller.clientWidth * .9), behavior: "smooth" });
+  };
   const totalBeadsOnHand = inventory.reduce((sum, item) => sum + item.quantity, 0);
   const galleryQuery = gallerySearch.trim().toLowerCase();
   const matchingGalleryTemplates = templates.filter((template) => {
@@ -1270,7 +1344,7 @@ function App() {
 
     {view === "home" && <>
       <section className="home-hero panel"><div><p className="eyebrow">我的拼豆神器</p><h2>今天你拼豆了吗？</h2><p>Turn pictures into bead patterns, keep your favorite work together, and see what colors you have on hand.</p><div className="button-row"><button className="primary-button" onClick={() => setView("upload")}>Upload a template</button><button className="secondary-button" onClick={() => setView("gallery")}>Explore Gallery</button></div></div><div className="home-stats"><div className="finished-pieces-stat"><strong>{artworks.length}</strong><span>Finished pieces</span></div><div className="templates-stat"><strong>{templates.length}</strong><span>Templates</span></div><div className="beads-on-hand-stat"><strong>{totalBeadsOnHand.toLocaleString()}</strong><span>Beads on hand</span></div></div></section>
-      <section className="content-section"><div className="section-heading"><div><p className="eyebrow">From your collection</p><h2>Featured Artwork</h2></div><button className="text-button" onClick={() => setView("gallery")}>View Gallery →</button></div>{featuredTemplates.length ? <div className="artwork-tiles featured-artwork-scroller">{featuredTemplates.map((template) => <ArtworkTile key={template.id} template={template} artwork={latestArtworkByTemplate.get(template.id)} onView={() => setViewerTemplate(template)} onEdit={() => editTemplate(template)} onComplete={() => logCompletion(template)} onExport={() => void exportTemplate(template)} />)}</div> : <Empty title="Your featured artwork starts here" text="Upload a picture or pattern to create your first featured template." />}</section>
+      <section className="content-section"><div className="section-heading"><div><p className="eyebrow">From your collection</p><h2>Featured Artwork</h2></div><div className="featured-heading-actions"><div className="featured-scroll-buttons" aria-label="Featured artwork controls"><button type="button" aria-label="Previous featured artwork" onClick={() => scrollFeatured(-1)}>‹</button><button type="button" aria-label="Next featured artwork" onClick={() => scrollFeatured(1)}>›</button></div><button className="text-button" onClick={() => setView("gallery")}>More</button></div></div>{featuredTemplates.length ? <div ref={featuredScroller} className="artwork-tiles featured-artwork-scroller">{featuredTemplates.map((template) => <ArtworkTile key={template.id} template={template} artwork={latestArtworkByTemplate.get(template.id)} onView={() => setViewerTemplate(template)} onEdit={() => editTemplate(template)} onComplete={() => logCompletion(template)} onExport={() => void exportTemplate(template)} />)}</div> : <Empty title="Your featured artwork starts here" text="Upload a picture or pattern to create your first featured template." />}</section>
     </>}
 
     {view === "upload" && (draft ? <TemplateEditor draft={draft} setDraft={setDraft} onSave={() => void saveTemplate()} onCancel={() => setDraft(null)} busy={busy} /> : <>
