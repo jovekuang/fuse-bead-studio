@@ -28,6 +28,11 @@ const RESOLUTIONS: Array<{ id: SizePreset; label: string; width?: number; height
   { id: "custom", label: "Custom" },
 ];
 
+function clampArtworkDimension(value: string): number {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? Math.min(128, Math.max(4, Math.round(parsed))) : 4;
+}
+
 function fitArtworkToSmall(draft: Draft): Draft | null {
   const occupied = draft.cells.flatMap((code, index) => code ? [{ x: index % draft.width, y: Math.floor(index / draft.width), code }] : []);
   if (!occupied.length) return null;
@@ -1228,7 +1233,7 @@ function App() {
   const [gallerySearch, setGallerySearch] = useState("");
   const [uploadMode, setUploadMode] = useState<UploadMode>("photo");
   const [draft, setDraft] = useState<Draft | null>(null); const [sourceFile, setSourceFile] = useState<File | null>(null); const [sourcePreview, setSourcePreview] = useState(""); const [sourceTitle, setSourceTitle] = useState("");
-  const [sizePreset, setSizePreset] = useState<SizePreset>("medium"); const [customWidth, setCustomWidth] = useState(52); const [customLength, setCustomLength] = useState(52);
+  const [sizePreset, setSizePreset] = useState<SizePreset>("medium"); const [customWidth, setCustomWidth] = useState("52"); const [customLength, setCustomLength] = useState("52");
   const [completionOpen, setCompletionOpen] = useState(false); const [completionFile, setCompletionFile] = useState<File | null>(null); const [completionPreview, setCompletionPreview] = useState("");
   const [completionTemplate, setCompletionTemplate] = useState(""); const [completionCaption, setCompletionCaption] = useState("");
   const [deleteTarget, setDeleteTarget] = useState<Template | null>(null); const [deleteStep, setDeleteStep] = useState<1 | 2>(1);
@@ -1323,7 +1328,7 @@ function App() {
     setBusy(true); setAnalysisStatus(uploadMode === "template" ? "Opening the existing template…" : uploadMode === "scratch" ? "Preparing a blank bead board…" : "Pixelating picture…");
     try {
       const preset = RESOLUTIONS.find((option) => option.id === sizePreset)!;
-      const width = sizePreset === "custom" ? customWidth : preset.width!; const height = sizePreset === "custom" ? customLength : preset.height!;
+      const width = sizePreset === "custom" ? clampArtworkDimension(customWidth) : preset.width!; const height = sizePreset === "custom" ? clampArtworkDimension(customLength) : preset.height!;
       const title = sourceTitle.trim() || (sourceFile ? sourceFile.name.replace(/\.[^.]+$/, "") : "Untitled template");
       if (uploadMode === "photo") {
         const grid = await pictureToGrid(sourceFile!, width, height); setDraft({ title, sourceKind: "photo", sourceFile: sourceFile!, ...grid });
@@ -1411,7 +1416,7 @@ function App() {
         <form onSubmit={prepareTemplate} className="create-form">
           {uploadMode !== "scratch" && <label className={`file-drop upload-file-drop ${sourcePreview ? "has-preview" : ""}`}><input key={uploadMode} ref={templateInput} type="file" accept="image/*" onChange={(e: ChangeEvent<HTMLInputElement>) => chooseSourceFile(e.target.files?.[0] ?? null)} />{sourcePreview && <img src={sourcePreview} alt="Preview of image to upload" />}<span>{sourceFile ? sourceFile.name : uploadMode === "photo" ? "Choose a photo or picture" : "Choose an existing template"}</span><small>{sourceFile ? "Click to choose a different image" : "JPG, PNG, WebP, GIF, or HEIC · up to 25 MB"}</small></label>}
           <label>Template name<input value={sourceTitle} onChange={(e) => setSourceTitle(e.target.value)} placeholder="Rainbow mushroom" /></label>
-          {uploadMode !== "template" && <fieldset className="resolution-picker"><legend>Artwork size</legend><div className="resolution-options">{RESOLUTIONS.map((option) => <label key={option.id} className={sizePreset === option.id ? "active" : ""}><input type="radio" name="resolution" value={option.id} checked={sizePreset === option.id} onChange={() => setSizePreset(option.id)} /><b>{option.label}</b><span>{option.id === "custom" ? "Choose width × length" : `${option.width} × ${option.height} beads`}</span></label>)}</div>{sizePreset === "custom" && <div className="custom-size"><label>Width<input aria-label="Custom artwork width" type="number" min="4" max="128" step="1" value={customWidth} onChange={(event) => setCustomWidth(Math.min(128, Math.max(4, Math.round(Number(event.target.value) || 4))))} /></label><span aria-hidden="true">×</span><label>Length<input aria-label="Custom artwork length" type="number" min="4" max="128" step="1" value={customLength} onChange={(event) => setCustomLength(Math.min(128, Math.max(4, Math.round(Number(event.target.value) || 4))))} /></label><small>4–128 beads per side</small></div>}</fieldset>}
+          {uploadMode !== "template" && <fieldset className="resolution-picker"><legend>Artwork size</legend><div className="resolution-options">{RESOLUTIONS.map((option) => <label key={option.id} className={sizePreset === option.id ? "active" : ""}><input type="radio" name="resolution" value={option.id} checked={sizePreset === option.id} onChange={() => setSizePreset(option.id)} /><b>{option.label}</b><span>{option.id === "custom" ? "Choose width × length" : `${option.width} × ${option.height} beads`}</span></label>)}</div>{sizePreset === "custom" && <div className="custom-size"><label>Width<input aria-label="Custom artwork width" type="number" min="4" max="128" step="1" value={customWidth} onChange={(event) => setCustomWidth(event.target.value)} onBlur={() => setCustomWidth(String(clampArtworkDimension(customWidth)))} /></label><span aria-hidden="true">×</span><label>Length<input aria-label="Custom artwork length" type="number" min="4" max="128" step="1" value={customLength} onChange={(event) => setCustomLength(event.target.value)} onBlur={() => setCustomLength(String(clampArtworkDimension(customLength)))} /></label><small>4–128 beads per side</small></div>}</fieldset>}
           {analysisStatus && <p className="analysis-status" role="status"><span />{analysisStatus}</p>}
           <button className="primary-button" disabled={busy}>{busy ? "Preparing…" : uploadMode === "scratch" ? "Start drawing" : uploadMode === "photo" ? "Pixelate" : "Upload"}</button>
         </form>
