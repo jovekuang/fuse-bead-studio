@@ -38,6 +38,7 @@ db.exec(`
     id TEXT PRIMARY KEY, title TEXT NOT NULL, source_filename TEXT NOT NULL,
     width INTEGER NOT NULL, height INTEGER NOT NULL, cells_json TEXT NOT NULL,
     source_kind TEXT NOT NULL DEFAULT 'photo', content_cropped INTEGER NOT NULL DEFAULT 0,
+    tags_json TEXT NOT NULL DEFAULT '[]',
     created_at TEXT NOT NULL, updated_at TEXT NOT NULL
   );
   CREATE TABLE IF NOT EXISTS inventory (
@@ -60,6 +61,8 @@ if (!templateColumns.some((column) => column.name === "source_kind"))
   db.exec("ALTER TABLE templates ADD COLUMN source_kind TEXT NOT NULL DEFAULT 'photo'");
 if (!templateColumns.some((column) => column.name === "content_cropped"))
   db.exec("ALTER TABLE templates ADD COLUMN content_cropped INTEGER NOT NULL DEFAULT 0");
+if (!templateColumns.some((column) => column.name === "tags_json"))
+  db.exec("ALTER TABLE templates ADD COLUMN tags_json TEXT NOT NULL DEFAULT '[]'");
 const artworkColumns = db.prepare("PRAGMA table_info(artworks)").all() as Array<{ name: string }>;
 if (!artworkColumns.some((column) => column.name === "inventory_deducted"))
   db.exec("ALTER TABLE artworks ADD COLUMN inventory_deducted INTEGER NOT NULL DEFAULT 1");
@@ -111,13 +114,13 @@ if (hasLegacyPhotos) db.exec(`
   SELECT id, NULL, 'Original gallery', filename, caption, '{}', created_at FROM photos
 `);
 
-type TemplateRow = { id: string; title: string; source_filename: string; source_kind: "photo" | "template" | "scratch"; width: number; height: number; cells_json: string; created_at: string; updated_at: string };
+type TemplateRow = { id: string; title: string; source_filename: string; source_kind: "photo" | "template" | "scratch"; width: number; height: number; cells_json: string; tags_json: string; created_at: string; updated_at: string };
 type ArtworkRow = { id: string; template_id: string | null; template_title: string; photo_filename: string; caption: string; usage_json: string; inventory_deducted: number; created_at: string };
 type InventoryRow = { code: string; quantity: number; low_threshold: number };
 type InventoryTransactionRow = { id: string; type: string; label: string; changes_json: string; created_at: string };
-type Grid = { title: string; sourceKind: "photo" | "template" | "scratch"; width: number; height: number; cells: Array<string | null> };
+type Grid = { title: string; sourceKind: "photo" | "template" | "scratch"; width: number; height: number; cells: Array<string | null>; tags: string[] };
 
-const templateDto = (row: TemplateRow) => ({ id: row.id, title: row.title, sourceKind: row.source_kind, sourceUrl: `/uploads/${row.source_filename}`, width: row.width, height: row.height, cells: JSON.parse(row.cells_json) as Array<string | null>, createdAt: row.created_at, updatedAt: row.updated_at });
+const templateDto = (row: TemplateRow) => ({ id: row.id, title: row.title, sourceKind: row.source_kind, sourceUrl: `/uploads/${row.source_filename}`, width: row.width, height: row.height, cells: JSON.parse(row.cells_json) as Array<string | null>, tags: JSON.parse(row.tags_json) as string[], createdAt: row.created_at, updatedAt: row.updated_at });
 const artworkDto = (row: ArtworkRow) => ({ id: row.id, templateId: row.template_id, templateTitle: row.template_title, photoUrl: `/uploads/${row.photo_filename}`, caption: row.caption, usage: JSON.parse(row.usage_json) as Record<string, number>, inventoryDeducted: Boolean(row.inventory_deducted), createdAt: row.created_at });
 const inventoryDto = (row: InventoryRow) => {
   const color = PALETTE.find((item) => item.code === row.code)!;
@@ -135,7 +138,7 @@ function parseGrid(value: unknown): { grid: Grid | null; error: string | null } 
   const input = value as Record<string, unknown>;
   const title = typeof input.title === "string" ? input.title.trim() : "";
   const sourceKind = input.sourceKind === "template" || input.sourceKind === "scratch" ? input.sourceKind : "photo";
-  const width = input.width; const height = input.height; const cells = input.cells;
+  const width = input.width; const height = input.height; const cells = input.cells; const tagsInput = input.tags ?? [];
   if (!title) return { grid: null, error: "Enter a template name." };
   if (title.length > 100) return { grid: null, error: "Template names must be 100 characters or fewer." };
   if (!Number.isInteger(width) || !Number.isInteger(height) || (width as number) < 4 || (width as number) > 128 || (height as number) < 4 || (height as number) > 128)
@@ -147,7 +150,10 @@ function parseGrid(value: unknown): { grid: Grid | null; error: string | null } 
   const invalidCodes = [...new Set(cells.filter((cell): cell is string => cell !== null && (typeof cell !== "string" || !PALETTE_CODES.has(cell))).map(String))];
   if (invalidCodes.length)
     return { grid: null, error: `Template contains unrecognized bead ${invalidCodes.length === 1 ? "color" : "colors"}: ${invalidCodes.slice(0, 5).join(", ")}.` };
-  return { grid: { title, sourceKind, width: width as number, height: height as number, cells }, error: null };
+  if (!Array.isArray(tagsInput) || tagsInput.some((tag) => typeof tag !== "string")) return { grid: null, error: "Template tags could not be read." };
+  const tags = [...new Set(tagsInput.map((tag) => tag.trim().replace(/^#+/, "").replace(/\s+/g, "-").replace(/[^\p{L}\p{N}_-]/gu, "").toLowerCase()).filter(Boolean))];
+  if (tags.length > 12 || tags.some((tag) => tag.length > 30)) return { grid: null, error: "Use up to 12 tags with 30 characters or fewer each." };
+  return { grid: { title, sourceKind, width: width as number, height: height as number, cells, tags }, error: null };
 }
 function formText(value: unknown): string {
   if (!value || typeof value !== "object" || !("value" in value)) return "";
@@ -223,14 +229,14 @@ app.post("/api/templates", async (request, reply) => {
   if (!parsed.grid) { await unlink(destination).catch(() => undefined); return reply.code(400).send({ message: parsed.error }); }
   const grid = parsed.grid;
   const now = new Date().toISOString();
-  db.prepare("INSERT INTO templates (id, title, source_filename, source_kind, width, height, cells_json, content_cropped, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?)").run(id, grid.title, filename, grid.sourceKind, grid.width, grid.height, JSON.stringify(grid.cells), now, now);
+  db.prepare("INSERT INTO templates (id, title, source_filename, source_kind, width, height, cells_json, content_cropped, tags_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)").run(id, grid.title, filename, grid.sourceKind, grid.width, grid.height, JSON.stringify(grid.cells), JSON.stringify(grid.tags), now, now);
   return reply.code(201).send(templateDto(db.prepare("SELECT * FROM templates WHERE id = ?").get(id) as TemplateRow));
 });
 app.put<{ Params: { id: string }; Body: unknown }>("/api/templates/:id", async (request, reply) => {
   const parsed = parseGrid(request.body);
   if (!parsed.grid) return reply.code(400).send({ message: parsed.error });
   const grid = parsed.grid;
-  const result = db.prepare("UPDATE templates SET title = ?, width = ?, height = ?, cells_json = ?, updated_at = ? WHERE id = ?").run(grid.title, grid.width, grid.height, JSON.stringify(grid.cells), new Date().toISOString(), request.params.id);
+  const result = db.prepare("UPDATE templates SET title = ?, width = ?, height = ?, cells_json = ?, tags_json = ?, updated_at = ? WHERE id = ?").run(grid.title, grid.width, grid.height, JSON.stringify(grid.cells), JSON.stringify(grid.tags), new Date().toISOString(), request.params.id);
   if (!result.changes) return reply.code(404).send({ message: "Template not found." });
   return templateDto(db.prepare("SELECT * FROM templates WHERE id = ?").get(request.params.id) as TemplateRow);
 });

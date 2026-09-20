@@ -6,11 +6,11 @@ type View = "home" | "upload" | "gallery" | "inventory";
 type UploadMode = "photo" | "template" | "scratch";
 type EditorTool = "brush" | "bucket" | "eraser" | "eyedropper" | "replace";
 type SizePreset = "small" | "medium" | "large" | "custom";
-type Template = { id: string; title: string; sourceKind: UploadMode; sourceUrl: string; width: number; height: number; cells: Array<string | null>; updatedAt: string };
+type Template = { id: string; title: string; sourceKind: UploadMode; sourceUrl: string; width: number; height: number; cells: Array<string | null>; tags: string[]; updatedAt: string };
 type Artwork = { id: string; templateId: string | null; templateTitle: string; photoUrl: string; caption: string; usage: Record<string, number>; inventoryDeducted: boolean; createdAt: string };
 type Inventory = { code: string; name: string; hex: string; quantity: number; lowThreshold: number; isLow: boolean };
 type StockTransaction = { id: string; type: "refill" | "use" | "adjustment"; label: string; changes: Record<string, number>; createdAt: string };
-type Draft = { id?: string; title: string; sourceKind: UploadMode; sourceFile?: File; sourceUrl: string; width: number; height: number; cells: Array<string | null> };
+type Draft = { id?: string; title: string; sourceKind: UploadMode; sourceFile?: File; sourceUrl: string; width: number; height: number; cells: Array<string | null>; tags: string[] };
 type OcrWord = { text: string; left: number; top: number; width: number; height: number; confidence: number };
 const NAV_LABELS: Record<View, string> = { home: "Home", upload: "Create", gallery: "Gallery", inventory: "Inventory" };
 const MAX_UPLOAD_BYTES = 25 * 1024 * 1024;
@@ -31,6 +31,10 @@ const RESOLUTIONS: Array<{ id: SizePreset; label: string; width?: number; height
 function clampArtworkDimension(value: string): number {
   const parsed = Number(value);
   return Number.isFinite(parsed) ? Math.min(128, Math.max(4, Math.round(parsed))) : 4;
+}
+
+function normalizeTemplateTag(value: string): string {
+  return value.trim().replace(/^#+/, "").replace(/\s+/g, "-").replace(/[^\p{L}\p{N}_-]/gu, "").toLowerCase().slice(0, 30);
 }
 
 function fitArtworkToSmall(draft: Draft): Draft | null {
@@ -1008,15 +1012,37 @@ function ArtworkTile({ template, artwork, onView, onEdit, onComplete, onExport, 
     <div className="artwork-tile-content">
       <div className="artwork-title-row"><h3>{template.title}</h3><button type="button" className="artwork-menu-trigger" aria-label={`More options for ${template.title}`} aria-expanded={menuOpen} onClick={() => setMenuOpen((open) => !open)}>⋮</button>{menuOpen && <div className="artwork-menu" role="menu"><button type="button" role="menuitem" onClick={() => runMenuAction(onEdit)}>Edit template</button><button type="button" role="menuitem" onClick={() => runMenuAction(onComplete)}>Add completed artwork</button><button type="button" role="menuitem" onClick={() => runMenuAction(onExport)}>Export PNG</button>{onRemove && <button type="button" role="menuitem" className="danger" onClick={() => runMenuAction(onRemove)}>Remove</button>}</div>}</div>
       <p>{boardLabel} · {beadCount} beads · {Object.keys(usage).length} colors</p>
+      {template.tags.length > 0 && <div className="artwork-tags">{template.tags.map((tag) => <span key={tag}>#{tag}</span>)}</div>}
       {artwork?.caption && <p className="artwork-caption">{artwork.caption}</p>}
     </div>
   </article>;
 }
 
-function MakingView({ template, onClose }: { template: Template; onClose: () => void }) {
+function MakingView({ template, inventory, onClose }: { template: Template; inventory: Inventory[]; onClose: () => void }) {
   const [zoom, setZoom] = useState(100); const [fitMode, setFitMode] = useState(true); const [wakeState, setWakeState] = useState<"active" | "unavailable" | "requesting">("requesting");
   const viewportRef = useRef<HTMLDivElement>(null); const drag = useRef<{ x: number; y: number; left: number; top: number } | null>(null);
   const usage = countBeads(template.cells); const usedColors = PALETTE.filter((color) => usage[color.code]);
+  const inventoryByCode = new Map(inventory.map((item) => [item.code, item]));
+  const replacementSurplus = new Map(inventory.map((item) => [item.code, Math.max(0, item.quantity - (usage[item.code] ?? 0))]));
+  const colorStock = usedColors.map((color) => {
+    const needed = usage[color.code]; const onHand = inventoryByCode.get(color.code)?.quantity ?? 0; const shortfall = Math.max(0, needed - onHand);
+    if (!shortfall) return { color, needed, onHand, shortfall, replacement: null as null | { color: (typeof PALETTE)[number]; available: number; coversShortfall: boolean } };
+    const canReplace = (item: Inventory) => { const candidate = paletteByCode.get(item.code); return item.code !== color.code && candidate && !candidate.transparent && candidate.code !== "T1"; };
+    const fullCandidates = new Set(inventory.filter((item) => canReplace(item) && (replacementSurplus.get(item.code) ?? 0) >= shortfall).map((item) => item.code));
+    const partialCandidates = new Set(inventory.filter((item) => canReplace(item) && (replacementSurplus.get(item.code) ?? 0) > 0).map((item) => item.code));
+    const candidates = fullCandidates.size ? fullCandidates : partialCandidates;
+    let replacement: null | { color: (typeof PALETTE)[number]; available: number; coversShortfall: boolean } = null;
+    if (candidates.size) {
+      const hex = color.hex.slice(1); const code = nearestColor(parseInt(hex.slice(0, 2), 16), parseInt(hex.slice(2, 4), 16), parseInt(hex.slice(4, 6), 16), candidates);
+      const replacementColor = paletteByCode.get(code); const available = replacementSurplus.get(code) ?? 0;
+      if (replacementColor && available > 0) {
+        replacement = { color: replacementColor, available, coversShortfall: available >= shortfall };
+        replacementSurplus.set(code, Math.max(0, available - Math.min(available, shortfall)));
+      }
+    }
+    return { color, needed, onHand, shortfall, replacement };
+  });
+  const shortages = colorStock.filter((item) => item.shortfall > 0); const totalShortfall = shortages.reduce((sum, item) => sum + item.shortfall, 0);
   const fitPattern = () => {
     const viewport = viewportRef.current; if (!viewport) return;
     const width = Math.floor((viewport.clientWidth - 56 - template.width - 1) / template.width);
@@ -1052,7 +1078,7 @@ function MakingView({ template, onClose }: { template: Template; onClose: () => 
   return <div className="making-view-backdrop"><section className="making-view" role="dialog" aria-modal="true" aria-label={`${template.title} making view`}>
     <header><div><p className="eyebrow">Creation mode</p><h2>{template.title}</h2><p>{template.width} × {template.height} · {Object.values(usage).reduce((sum, count) => sum + count, 0).toLocaleString()} beads</p></div><div className="making-header-actions"><span className={`wake-status ${wakeState}`}>{wakeState === "active" ? "● Screen stays awake" : wakeState === "requesting" ? "○ Keeping screen awake…" : "○ Keep device awake manually"}</span><button type="button" aria-label="Close making view" onClick={onClose}>×</button></div></header>
     <div className="making-toolbar"><span>Drag to move around the pattern · dark lines mark 10 × 10 blocks</span><div className="zoom-controls" aria-label="Making view zoom controls"><button type="button" onClick={() => { setFitMode(false); setZoom((value) => Math.max(5, value - 25)); }} disabled={zoom === 5} aria-label="Zoom out">−</button><input type="range" min="5" max="300" step="1" value={zoom} onChange={(event) => { setFitMode(false); setZoom(Number(event.target.value)); }} aria-label="Zoom level" /><span>{zoom}%</span><button type="button" onClick={() => { setFitMode(false); setZoom((value) => Math.min(300, value + 25)); }} disabled={zoom === 300} aria-label="Zoom in">+</button><button type="button" className="fit-button" onClick={() => { setFitMode(true); fitPattern(); }}>Fit</button></div></div>
-    <div className="making-layout"><div ref={viewportRef} className={`making-viewport ${drag.current ? "dragging" : ""}`} onPointerDown={beginPan} onPointerMove={pan} onPointerUp={() => { drag.current = null; }} onPointerCancel={() => { drag.current = null; }}><div className="making-board"><BeadGrid draft={{ ...template }} zoom={zoom} showEmptyMark={false} majorGrid /></div></div><aside className="making-legend"><div><strong>Colors used</strong><span>{usedColors.length}</span></div>{usedColors.map((color) => <div className="making-color" key={color.code}><i className={color.transparent ? "transparent-swatch" : ""} style={{ background: color.transparent ? undefined : color.hex }} /><b>{color.code}</b><span>{usage[color.code].toLocaleString()}</span></div>)}</aside></div>
+    <div className="making-layout"><div ref={viewportRef} className={`making-viewport ${drag.current ? "dragging" : ""}`} onPointerDown={beginPan} onPointerMove={pan} onPointerUp={() => { drag.current = null; }} onPointerCancel={() => { drag.current = null; }}><div className="making-board"><BeadGrid draft={{ ...template }} zoom={zoom} showEmptyMark={false} majorGrid /></div></div><aside className="making-legend"><div><strong>Colors used</strong><span>{usedColors.length}</span></div><div className={`making-stock-summary ${shortages.length ? "short" : "ready"}`}><strong>{shortages.length ? `${totalShortfall.toLocaleString()} beads short` : "Inventory ready"}</strong><span>{shortages.length ? `${shortages.length} ${shortages.length === 1 ? "color needs" : "colors need"} a replacement.` : "You have enough beads to complete this artwork."}</span></div>{colorStock.map(({ color, needed, onHand, shortfall, replacement }) => <div className={`making-color ${shortfall ? "short" : "ready"}`} key={color.code}><i className={`making-color-swatch ${color.transparent ? "transparent-swatch" : ""}`} style={{ background: color.transparent ? undefined : color.hex }} /><div className="making-color-details"><b>{color.code}</b><span>Need {needed.toLocaleString()} · Have {onHand.toLocaleString()}</span></div><strong className="making-color-state">{shortfall ? `${shortfall.toLocaleString()} short` : "✓ Enough"}</strong>{shortfall > 0 && <div className="making-replacement">{replacement ? <><i className={replacement.color.transparent ? "transparent-swatch" : ""} style={{ background: replacement.color.transparent ? undefined : replacement.color.hex }} /><span>{replacement.coversShortfall ? "Closest replacement" : "Closest partial replacement"}: <b>{replacement.color.code}</b>{!replacement.coversShortfall && ` · ${replacement.available.toLocaleString()} available`}</span></> : <span>No stocked replacement is available.</span>}</div>}</div>)}</aside></div>
   </section></div>;
 }
 
@@ -1073,6 +1099,7 @@ function InventoryActionIcon({ action }: { action: "refill" | "use" | "history" 
 
 function TemplateEditor({ draft, setDraft, onSave, onCancel, busy }: { draft: Draft; setDraft: (draft: Draft) => void; onSave: () => void; onCancel: () => void; busy: boolean }) {
   const [selected, setSelected] = useState(PALETTE[0].code);
+  const [tagInput, setTagInput] = useState("");
   const [tool, setTool] = useState<EditorTool>("brush");
   const [zoom, setZoom] = useState(100);
   const [colorOpen, setColorOpen] = useState(false);
@@ -1106,6 +1133,12 @@ function TemplateEditor({ draft, setDraft, onSave, onCancel, busy }: { draft: Dr
   const visibleColors = PALETTE.filter((color) => color.code.startsWith(colorSeries) && (color.code.toLowerCase().includes(paletteSearch.toLowerCase()) || color.name.toLowerCase().includes(paletteSearch.toLowerCase())));
   const usedColors = PALETTE.filter((color) => counts[color.code]);
   const commitDraft = (next: Draft) => { setHistory((current) => [...current.slice(-49), draft]); setDraft(next); };
+  const addTags = (value = tagInput) => {
+    const additions = value.split(/[,\s]+/).map(normalizeTemplateTag).filter(Boolean);
+    if (additions.length) setDraft({ ...draft, tags: [...new Set([...draft.tags, ...additions])].slice(0, 12) });
+    setTagInput("");
+  };
+  const removeTag = (tag: string) => setDraft({ ...draft, tags: draft.tags.filter((item) => item !== tag) });
   const undo = () => setHistory((current) => {
     const previous = current.at(-1); if (!previous) return current;
     setDraft(previous); return current.slice(0, -1);
@@ -1202,7 +1235,7 @@ function TemplateEditor({ draft, setDraft, onSave, onCancel, busy }: { draft: Dr
     context.drawImage(image, sourceX, sourceY, 1, 1, 0, 0, 1, 1); const pixel = context.getImageData(0, 0, 1, 1).data; if (pixel[3] < 40) return;
     const code = nearestColor(pixel[0], pixel[1], pixel[2]); setSelected(code); setColorSeries(code[0]); setTool("brush"); setSourceOpen(false);
   };
-  return <section className="editor panel"><div className="editor-top"><div><p className="eyebrow">{draft.id ? "Edit template" : draft.sourceKind === "template" ? "Review imported pattern" : draft.sourceKind === "scratch" ? "Draw a new template" : "Review conversion"}</p><input className="title-input" aria-label="Template title" value={draft.title} maxLength={100} onChange={(e) => setDraft({ ...draft, title: e.target.value })} /></div><div className="button-row"><button className="secondary-button" onClick={onCancel}>Cancel</button><button className="primary-button compact" onClick={onSave} disabled={busy || !draft.title.trim()}>{busy ? "Saving…" : "Save template"}</button></div></div>
+  return <section className="editor panel"><div className="editor-top"><div className="editor-title-fields"><p className="eyebrow">{draft.id ? "Edit template" : draft.sourceKind === "template" ? "Review imported pattern" : draft.sourceKind === "scratch" ? "Draw a new template" : "Review conversion"}</p><input className="title-input" aria-label="Template title" value={draft.title} maxLength={100} onChange={(e) => setDraft({ ...draft, title: e.target.value })} /><div className="template-tags-editor" aria-label="Template tags">{draft.tags.map((tag) => <span key={tag}>#{tag}<button type="button" aria-label={`Remove #${tag}`} onClick={() => removeTag(tag)}>×</button></span>)}{draft.tags.length < 12 && <input aria-label="Add template tag" value={tagInput} maxLength={31} placeholder={draft.tags.length ? "Add #tag" : "Add #tags to organize this template"} onChange={(event) => setTagInput(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" || event.key === ",") { event.preventDefault(); addTags(); } else if (event.key === "Backspace" && !tagInput && draft.tags.length) removeTag(draft.tags[draft.tags.length - 1]); }} onBlur={() => addTags()} />}</div></div><div className="button-row"><button className="secondary-button" onClick={onCancel}>Cancel</button><button className="primary-button compact" onClick={onSave} disabled={busy || !draft.title.trim()}>{busy ? "Saving…" : "Save template"}</button></div></div>
     {draft.sourceKind !== "scratch" && <section className="source-strip"><div><strong>Uploaded {draft.sourceKind === "template" ? "template" : "picture"}</strong><span>{tool === "eyedropper" ? "Open the original, then click any point to sample its closest bead color." : `Click the preview to view the high-resolution original${draft.sourceKind === "template" ? " with its legend" : ""}.`}</span></div><button type="button" className="source-preview-button" onClick={() => setSourceOpen(true)} aria-label={tool === "eyedropper" ? "Open original image to sample a color" : "View high-resolution original image"}><img src={draft.sourceUrl} alt="Original uploaded source" /></button></section>}
     <div className="editor-workspace">
       <section className="comparison-pane template-pane">
@@ -1263,6 +1296,8 @@ function App() {
   const matchingGalleryTemplates = templates.filter((template) => {
     if (!galleryQuery) return true;
     if (template.title.toLowerCase().includes(galleryQuery)) return true;
+    const tagQuery = galleryQuery.replace(/^#+/, "");
+    if (tagQuery && template.tags.some((tag) => tag.toLowerCase().includes(tagQuery))) return true;
     return Object.keys(countBeads(template.cells)).some((code) => {
       const color = paletteByCode.get(code);
       return code.toLowerCase().includes(galleryQuery) || color?.name.toLowerCase().includes(galleryQuery);
@@ -1331,12 +1366,12 @@ function App() {
       const width = sizePreset === "custom" ? clampArtworkDimension(customWidth) : preset.width!; const height = sizePreset === "custom" ? clampArtworkDimension(customLength) : preset.height!;
       const title = sourceTitle.trim() || (sourceFile ? sourceFile.name.replace(/\.[^.]+$/, "") : "Untitled template");
       if (uploadMode === "photo") {
-        const grid = await pictureToGrid(sourceFile!, width, height); setDraft({ title, sourceKind: "photo", sourceFile: sourceFile!, ...grid });
+        const grid = await pictureToGrid(sourceFile!, width, height); setDraft({ title, sourceKind: "photo", sourceFile: sourceFile!, tags: [], ...grid });
       } else if (uploadMode === "template") {
-        const grid = await existingTemplateToGrid(sourceFile!, setAnalysisStatus); setDraft({ title, sourceKind: "template", sourceFile: sourceFile!, sourceUrl: grid.sourceUrl, width: grid.width, height: grid.height, cells: grid.cells });
+        const grid = await existingTemplateToGrid(sourceFile!, setAnalysisStatus); setDraft({ title, sourceKind: "template", sourceFile: sourceFile!, sourceUrl: grid.sourceUrl, width: grid.width, height: grid.height, cells: grid.cells, tags: [] });
       } else {
         const sourceFile = await scratchSource(width, height);
-        setDraft({ title, sourceKind: "scratch", sourceFile, sourceUrl: "", width, height, cells: Array(width * height).fill(null) });
+        setDraft({ title, sourceKind: "scratch", sourceFile, sourceUrl: "", width, height, cells: Array(width * height).fill(null), tags: [] });
       }
     } catch (cause) { notify(cause instanceof Error ? cause.message : "This image could not be analyzed.", true); }
     finally { setBusy(false); setAnalysisStatus(""); }
@@ -1349,7 +1384,7 @@ function App() {
     if (cells.length !== expectedCells) { notify(`This ${draft.width} × ${draft.height} template needs ${expectedCells.toLocaleString()} cells, but has ${cells.length.toLocaleString()}.`, true); return; }
     const invalidCodes = [...new Set(cells.filter((cell): cell is string => cell !== null && !paletteByCode.has(cell)))];
     if (invalidCodes.length) { notify(`Template contains unrecognized bead ${invalidCodes.length === 1 ? "color" : "colors"}: ${invalidCodes.slice(0, 5).join(", ")}.`, true); return; }
-    const grid = { title: draft.title.trim(), sourceKind: draft.sourceKind, width: draft.width, height: draft.height, cells };
+    const grid = { title: draft.title.trim(), sourceKind: draft.sourceKind, width: draft.width, height: draft.height, cells, tags: draft.tags };
     setBusy(true);
     try {
       if (draft.id) await api(`/api/templates/${draft.id}`, { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(grid) });
@@ -1426,11 +1461,11 @@ function App() {
 
     {view === "gallery" && <>
       <section className="gallery-section"><div className="section-heading"><div><p className="eyebrow">Your collection</p><h2>Gallery</h2><p>Finished photos appear here when attached; otherwise you see the bead template.</p></div><span className="count">{galleryQuery ? `${matchingGalleryTemplates.length} of ${templates.length}` : templates.length} {templates.length === 1 ? "template" : "templates"}</span></div>
-        {templates.length > 0 && <label className="gallery-search"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="6" /><path d="m16 16 4 4" /></svg><input type="search" value={gallerySearch} onChange={(event) => setGallerySearch(event.target.value)} placeholder="Search by template name or color" aria-label="Search Gallery by template name or color" /></label>}
-        {matchingGalleryTemplates.length ? <div className="artwork-tiles">{matchingGalleryTemplates.map((template) => <ArtworkTile key={template.id} template={template} artwork={latestArtworkByTemplate.get(template.id)} onView={() => setViewerTemplate(template)} onEdit={() => editTemplate(template)} onComplete={() => logCompletion(template)} onExport={() => void exportTemplate(template)} onRemove={latestArtworkByTemplate.has(template.id) ? undefined : () => { setDeleteTarget(template); setDeleteStep(1); }} />)}</div> : templates.length ? <div className="gallery-search-empty"><strong>No templates found</strong><span>Try a template name, color code, or color name.</span><button type="button" className="text-button" onClick={() => setGallerySearch("")}>Clear search</button></div> : <Empty title="No artwork templates yet" text="Upload a picture, existing pattern, or draw one from scratch to start your gallery." />}</section>
+        {templates.length > 0 && <label className="gallery-search"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="6" /><path d="m16 16 4 4" /></svg><input type="search" value={gallerySearch} onChange={(event) => setGallerySearch(event.target.value)} placeholder="Search by name, color, or #tag" aria-label="Search Gallery by template name, color, or tag" /></label>}
+        {matchingGalleryTemplates.length ? <div className="artwork-tiles">{matchingGalleryTemplates.map((template) => <ArtworkTile key={template.id} template={template} artwork={latestArtworkByTemplate.get(template.id)} onView={() => setViewerTemplate(template)} onEdit={() => editTemplate(template)} onComplete={() => logCompletion(template)} onExport={() => void exportTemplate(template)} onRemove={latestArtworkByTemplate.has(template.id) ? undefined : () => { setDeleteTarget(template); setDeleteStep(1); }} />)}</div> : templates.length ? <div className="gallery-search-empty"><strong>No templates found</strong><span>Try a template name, #tag, color code, or color name.</span><button type="button" className="text-button" onClick={() => setGallerySearch("")}>Clear search</button></div> : <Empty title="No artwork templates yet" text="Upload a picture, existing pattern, or draw one from scratch to start your gallery." />}</section>
     </>}
 
-    {viewerTemplate && <MakingView template={viewerTemplate} onClose={() => setViewerTemplate(null)} />}
+    {viewerTemplate && <MakingView template={viewerTemplate} inventory={inventory} onClose={() => setViewerTemplate(null)} />}
     {completionOpen && <div className="gallery-modal-backdrop" onClick={(event) => { if (event.target === event.currentTarget && !busy) closeCompletion(); }}><section className="gallery-modal completion-modal" role="dialog" aria-modal="true" aria-label="Add completed artwork"><header><div><p className="eyebrow">Finished piece</p><h2>Add completed artwork</h2></div><button type="button" aria-label="Close completed artwork" onClick={closeCompletion} disabled={busy}>×</button></header><p className="completion-template-name">Template: <strong>{templates.find((template) => template.id === completionTemplate)?.title}</strong></p><form className="create-form completion-form" onSubmit={completeArtwork}><label className={`file-drop completion-file-drop ${completionPreview ? "has-preview" : ""}`}><input ref={artworkInput} type="file" accept="image/*" onChange={(event) => setCompletionFile(event.target.files?.[0] ?? null)} />{completionPreview && <img src={completionPreview} alt="Preview of completed artwork to upload" />}<span>{completionFile?.name ?? "Choose completed artwork photo"}</span>{completionFile && <small>Click to choose a different photo</small>}</label><label>Caption <small>optional</small><input value={completionCaption} onChange={(event) => setCompletionCaption(event.target.value)} placeholder="Made for the game room" /></label><div className="gallery-modal-actions"><button type="button" className="secondary-button" onClick={closeCompletion} disabled={busy}>Cancel</button><button className="primary-button" disabled={busy || !completionTemplate}>{busy ? "Saving…" : "Complete artwork"}</button></div></form></section></div>}
 
     {deleteTarget && <div className="gallery-modal-backdrop" onClick={(event) => { if (event.target === event.currentTarget && !busy) setDeleteTarget(null); }}><section className="gallery-modal delete-modal" role="alertdialog" aria-modal="true" aria-label={deleteStep === 1 ? "Confirm template removal" : "Final template removal confirmation"}><header><div><p className="eyebrow">{deleteStep === 1 ? "Remove template" : "Final confirmation"}</p><h2>{deleteStep === 1 ? `Remove “${deleteTarget.title}”?` : "Delete this template permanently?"}</h2></div><button type="button" aria-label="Cancel template removal" onClick={() => setDeleteTarget(null)} disabled={busy}>×</button></header><p>{deleteStep === 1 ? "This will remove the saved bead pattern and its original upload." : `This is your second confirmation. “${deleteTarget.title}” cannot be recovered after deletion.`}</p><div className="gallery-modal-actions"><button type="button" className="secondary-button" onClick={() => setDeleteTarget(null)} disabled={busy}>Cancel</button>{deleteStep === 1 ? <button type="button" className="primary-button" onClick={() => setDeleteStep(2)}>Continue</button> : <button type="button" className="primary-button delete-confirm-button" onClick={() => void removeTemplate()} disabled={busy}>{busy ? "Deleting…" : "Delete template"}</button>}</div></section></div>}
