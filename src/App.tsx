@@ -1098,13 +1098,13 @@ function InventoryActionIcon({ action }: { action: "refill" | "use" | "history" 
 }
 
 function TemplateEditor({ draft, setDraft, onSave, onCancel, busy }: { draft: Draft; setDraft: (draft: Draft) => void; onSave: () => void; onCancel: () => void; busy: boolean }) {
-  const [selected, setSelected] = useState(PALETTE[0].code);
+  const [selected, setSelected] = useState("H7");
   const [tagInput, setTagInput] = useState("");
   const [tool, setTool] = useState<EditorTool>("brush");
   const [zoom, setZoom] = useState(100);
   const [colorOpen, setColorOpen] = useState(false);
   const [sourceOpen, setSourceOpen] = useState(false);
-  const [colorSeries, setColorSeries] = useState(PALETTE[0].code[0]);
+  const [colorSeries, setColorSeries] = useState("H");
   const [paletteSearch, setPaletteSearch] = useState("");
   const [history, setHistory] = useState<Draft[]>([]);
   const [resizeOpen, setResizeOpen] = useState(false);
@@ -1293,14 +1293,17 @@ function App() {
   };
   const totalBeadsOnHand = inventory.reduce((sum, item) => sum + item.quantity, 0);
   const galleryQuery = gallerySearch.trim().toLowerCase();
+  const galleryColorCode = paletteByCode.has(galleryQuery.toUpperCase()) ? galleryQuery.toUpperCase() : null;
   const matchingGalleryTemplates = templates.filter((template) => {
     if (!galleryQuery) return true;
+    const usage = countBeads(template.cells);
+    if (galleryColorCode) return Boolean(usage[galleryColorCode]);
     if (template.title.toLowerCase().includes(galleryQuery)) return true;
     const tagQuery = galleryQuery.replace(/^#+/, "");
     if (tagQuery && template.tags.some((tag) => tag.toLowerCase().includes(tagQuery))) return true;
-    return Object.keys(countBeads(template.cells)).some((code) => {
+    return Object.keys(usage).some((code) => {
       const color = paletteByCode.get(code);
-      return code.toLowerCase().includes(galleryQuery) || color?.name.toLowerCase().includes(galleryQuery);
+      return color?.name.toLowerCase().includes(galleryQuery);
     });
   });
   const useTransactions = stockTransactions.filter((transaction) => transaction.type === "use");
