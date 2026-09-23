@@ -12,6 +12,7 @@ type Inventory = { code: string; name: string; hex: string; quantity: number; lo
 type StockTransaction = { id: string; type: "refill" | "use" | "adjustment"; label: string; changes: Record<string, number>; createdAt: string };
 type Draft = { id?: string; title: string; sourceKind: UploadMode; sourceFile?: File; sourceUrl: string; width: number; height: number; cells: Array<string | null>; tags: string[] };
 type OcrWord = { text: string; left: number; top: number; width: number; height: number; confidence: number };
+type GalleryBackup = { format: "fuse-bead-gallery-backup"; version: 1; title: string; width: number; height: number; cells: Array<string | null>; tags: string[] };
 const NAV_LABELS: Record<View, string> = { home: "Home", upload: "Create", gallery: "Gallery", inventory: "Inventory" };
 const MAX_UPLOAD_BYTES = 25 * 1024 * 1024;
 const SERIES = [...new Set(PALETTE.map((color) => color.code[0]))];
@@ -537,7 +538,37 @@ async function readTemplatePage(image: HTMLImageElement): Promise<{ width: numbe
   return width >= 4 && width <= 128 && height >= 4 && height <= 128 ? { width, height, totalBeads, words: words.map((word) => ({ ...word, left: word.left / scale, top: word.top / scale, width: word.width / scale, height: word.height / scale })) } : null;
 }
 
-async function existingTemplateToGrid(file: File, progress: (message: string) => void): Promise<{ sourceUrl: string; width: number; height: number; cells: Array<string | null>; labelsRead: number; occupied: number }> {
+async function readGalleryBackup(file: File): Promise<GalleryBackup | null> {
+  if (file.type !== "image/png") return null;
+  const bytes = new Uint8Array(await file.arrayBuffer());
+  if (bytes.length < 8 || ![137, 80, 78, 71, 13, 10, 26, 10].every((byte, index) => bytes[index] === byte)) return null;
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength); let offset = 8;
+  while (offset + 12 <= bytes.length) {
+    const length = view.getUint32(offset); const typeOffset = offset + 4; const dataOffset = offset + 8; const end = dataOffset + length;
+    if (end + 4 > bytes.length) return null;
+    const type = new TextDecoder("ascii").decode(bytes.subarray(typeOffset, typeOffset + 4));
+    if (type === "iTXt") {
+      const data = bytes.subarray(dataOffset, end); const keywordEnd = data.indexOf(0);
+      if (keywordEnd >= 0 && new TextDecoder("ascii").decode(data.subarray(0, keywordEnd)) === "fuse-bead-template") {
+        let cursor = keywordEnd + 3;
+        for (let field = 0; field < 2; field += 1) { const fieldEnd = data.indexOf(0, cursor); if (fieldEnd < 0) return null; cursor = fieldEnd + 1; }
+        try {
+          const parsed = JSON.parse(new TextDecoder().decode(data.subarray(cursor))) as GalleryBackup;
+          if (parsed.format === "fuse-bead-gallery-backup" && parsed.version === 1 && typeof parsed.title === "string" && Number.isInteger(parsed.width) && Number.isInteger(parsed.height) && parsed.width >= 4 && parsed.width <= 128 && parsed.height >= 4 && parsed.height <= 128 && Array.isArray(parsed.cells) && parsed.cells.length === parsed.width * parsed.height && parsed.cells.every((cell) => cell === null || typeof cell === "string" && paletteByCode.has(cell)) && Array.isArray(parsed.tags) && parsed.tags.every((tag) => typeof tag === "string")) return parsed;
+        } catch { return null; }
+      }
+    }
+    offset = end + 4;
+  }
+  return null;
+}
+
+async function existingTemplateToGrid(file: File, progress: (message: string) => void): Promise<{ sourceUrl: string; width: number; height: number; cells: Array<string | null>; labelsRead: number; occupied: number; title?: string; tags?: string[] }> {
+  const backup = await readGalleryBackup(file);
+  if (backup) {
+    progress("Restoring the exact Gallery backup…");
+    return { sourceUrl: URL.createObjectURL(file), width: backup.width, height: backup.height, cells: backup.cells, labelsRead: backup.cells.filter(Boolean).length, occupied: backup.cells.filter(Boolean).length, title: backup.title, tags: backup.tags };
+  }
   const sourceUrl = URL.createObjectURL(file); const image = new Image(); image.src = sourceUrl; await image.decode();
   progress("Reading the printed template size…");
   const printedPage = await readTemplatePage(image).catch(() => null); const printedSize = printedPage ? { width: printedPage.width, height: printedPage.height } : null;
@@ -989,13 +1020,7 @@ async function exportTemplateImage(template: Template): Promise<string> {
   const url = URL.createObjectURL(blob); const link = document.createElement("a");
   link.href = url; link.download = downloadName;
   document.body.append(link); link.click(); link.remove(); window.setTimeout(() => URL.revokeObjectURL(url), 1000);
-  const body = new FormData(); body.append("title", template.title); body.append("image", blob, downloadName);
-  try {
-    const backup = await api<{ filename: string }>("/api/template-exports", { method: "POST", body });
-    return backup.filename;
-  } catch {
-    throw new Error("The PNG was downloaded, but its backup copy could not be saved.");
-  }
+  return downloadName;
 }
 
 function ArtworkTile({ template, artwork, onView, onEdit, onComplete, onExport, onRemoveArtwork, onRemove }: {
@@ -1373,7 +1398,7 @@ function App() {
       if (uploadMode === "photo") {
         const grid = await pictureToGrid(sourceFile!, width, height); setDraft({ title, sourceKind: "photo", sourceFile: sourceFile!, tags: [], ...grid });
       } else if (uploadMode === "template") {
-        const grid = await existingTemplateToGrid(sourceFile!, setAnalysisStatus); setDraft({ title, sourceKind: "template", sourceFile: sourceFile!, sourceUrl: grid.sourceUrl, width: grid.width, height: grid.height, cells: grid.cells, tags: [] });
+        const grid = await existingTemplateToGrid(sourceFile!, setAnalysisStatus); setDraft({ title: sourceTitle.trim() || grid.title || title, sourceKind: "template", sourceFile: sourceFile!, sourceUrl: grid.sourceUrl, width: grid.width, height: grid.height, cells: grid.cells, tags: grid.tags ?? [] });
       } else {
         setDraft({ title, sourceKind: "scratch", sourceUrl: "", width, height, cells: Array(width * height).fill(null), tags: [] });
       }
@@ -1403,7 +1428,7 @@ function App() {
     finally { setBusy(false); }
   };
   const editTemplate = (template: Template) => { setView("upload"); setDraft({ ...template }); window.scrollTo({ top: 0, behavior: "smooth" }); };
-  const exportTemplate = async (template: Template) => { try { await exportTemplateImage(template); notify("Image exported and backed up."); } catch (cause) { notify(cause instanceof Error ? cause.message : "Could not export template.", true); } };
+  const exportTemplate = async (template: Template) => { try { await exportTemplateImage(template); notify("Image exported."); } catch (cause) { notify(cause instanceof Error ? cause.message : "Could not export template.", true); } };
   const logCompletion = (template: Template) => { setView("gallery"); setCompletionTemplate(template.id); setCompletionOpen(true); };
   const closeCompletion = () => { setCompletionOpen(false); setCompletionFile(null); setCompletionTemplate(""); setCompletionCaption(""); if (artworkInput.current) artworkInput.current.value = ""; };
   const removeTemplate = async () => { if (!deleteTarget || deleteStep !== 2) return; setBusy(true); try { await api(`/api/templates/${deleteTarget.id}`, { method: "DELETE" }); setDeleteTarget(null); setDeleteStep(1); await refresh(); } catch (cause) { notify(cause instanceof Error ? cause.message : "Could not remove template.", true); } finally { setBusy(false); } };

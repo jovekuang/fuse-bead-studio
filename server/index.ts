@@ -3,13 +3,14 @@ import multipart from "@fastify/multipart";
 import fastifyStatic from "@fastify/static";
 import Database from "better-sqlite3";
 import { createWriteStream, readFileSync } from "node:fs";
-import { mkdir, unlink } from "node:fs/promises";
+import { access, mkdir, readFile, readdir, rename, unlink, writeFile } from "node:fs/promises";
 import { pipeline } from "node:stream/promises";
 import { randomUUID } from "node:crypto";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { createWorker, PSM } from "tesseract.js";
 import { PALETTE, PALETTE_CODES, countBeads } from "../shared/palette.js";
+import { galleryBackupFilename, renderGalleryBackupPng, type GalleryBackupTemplate } from "./templateBackup.js";
 
 const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const configPath = process.env.APP_CONFIG ?? path.join(projectRoot, "app.config.json");
@@ -139,6 +140,46 @@ type InventoryRow = { code: string; quantity: number; low_threshold: number };
 type InventoryTransactionRow = { id: string; type: string; label: string; changes_json: string; created_at: string };
 type Grid = { title: string; sourceKind: "photo" | "template" | "scratch"; width: number; height: number; cells: Array<string | null>; tags: string[] };
 
+type GalleryBackupManifest = { version: 1; templates: Record<string, { updatedAt: string; filename: string }> };
+const galleryBackupManifestPath = path.join(downloadDir, ".gallery-backup.json");
+const fileExists = async (filename: string) => access(filename).then(() => true, () => false);
+async function writeAtomic(filename: string, value: Buffer | string) {
+  const temporary = `${filename}.${randomUUID()}.tmp`;
+  await writeFile(temporary, value);
+  try { await rename(temporary, filename); }
+  catch (error) { await unlink(temporary).catch(() => undefined); throw error; }
+}
+async function syncGalleryBackups(): Promise<{ written: number; removed: number }> {
+  let manifest: GalleryBackupManifest = { version: 1, templates: {} };
+  try {
+    const parsed = JSON.parse(await readFile(galleryBackupManifestPath, "utf8")) as GalleryBackupManifest;
+    if (parsed.version === 1 && parsed.templates && typeof parsed.templates === "object") manifest = parsed;
+  } catch { /* The first sync creates the manifest. */ }
+  const rows = db.prepare("SELECT * FROM templates ORDER BY id").all() as TemplateRow[];
+  const templates = rows.map((row): GalleryBackupTemplate => ({
+    id: row.id, title: row.title, sourceKind: row.source_kind, width: row.width, height: row.height,
+    cells: JSON.parse(row.cells_json) as Array<string | null>, tags: JSON.parse(row.tags_json) as string[], updatedAt: row.updated_at,
+  }));
+  const next: GalleryBackupManifest = { version: 1, templates: {} };
+  let written = 0; let removed = 0;
+  for (const template of templates) {
+    const filename = galleryBackupFilename(template); const destination = path.join(downloadDir, filename);
+    const previous = manifest.templates[template.id];
+    if (!previous || previous.updatedAt !== template.updatedAt || previous.filename !== filename || !await fileExists(destination)) {
+      await writeAtomic(destination, renderGalleryBackupPng(template, PALETTE)); written += 1;
+    }
+    next.templates[template.id] = { updatedAt: template.updatedAt, filename };
+  }
+  const expected = new Set(Object.values(next.templates).map((entry) => entry.filename));
+  for (const filename of await readdir(downloadDir)) {
+    if (!filename.endsWith(".png") || expected.has(filename)) continue;
+    await unlink(path.join(downloadDir, filename)).catch(() => undefined); removed += 1;
+  }
+  if (written || removed || JSON.stringify(manifest) !== JSON.stringify(next))
+    await writeAtomic(galleryBackupManifestPath, `${JSON.stringify(next, null, 2)}\n`);
+  return { written, removed };
+}
+
 const templateDto = (row: TemplateRow) => ({ id: row.id, title: row.title, sourceKind: row.source_kind, sourceUrl: row.source_filename ? `/uploads/${row.source_filename}` : "", width: row.width, height: row.height, cells: JSON.parse(row.cells_json) as Array<string | null>, tags: JSON.parse(row.tags_json) as string[], createdAt: row.created_at, updatedAt: row.updated_at });
 const artworkDto = (row: ArtworkRow) => ({ id: row.id, templateId: row.template_id, templateTitle: row.template_title, photoUrl: `/uploads/${row.photo_filename}`, caption: row.caption, usage: JSON.parse(row.usage_json) as Record<string, number>, inventoryDeducted: Boolean(row.inventory_deducted), createdAt: row.created_at });
 const inventoryDto = (row: InventoryRow) => {
@@ -230,26 +271,6 @@ app.post("/api/ocr-template", async (request, reply) => {
     }];
   });
   return { words, text: result.data.text ?? "" };
-});
-
-app.post("/api/template-exports", async (request, reply) => {
-  const part = await request.file();
-  if (!part || part.mimetype !== "image/png") {
-    part?.file.resume();
-    return reply.code(415).send({ message: "Template backups must be PNG files." });
-  }
-  const title = formText(part.fields.title).trim().normalize("NFKC")
-    .replace(/[^\p{L}\p{N}._-]+/gu, "-").replace(/^-+|-+$/g, "").slice(0, 70) || "bead-template";
-  const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
-  const filename = `${title}-${timestamp}-${randomUUID().slice(0, 8)}.png`;
-  const destination = path.join(downloadDir, filename);
-  try { await pipeline(part.file, createWriteStream(destination)); }
-  catch (error) { await unlink(destination).catch(() => undefined); throw error; }
-  if (part.file.truncated) {
-    await unlink(destination).catch(() => undefined);
-    return reply.code(413).send({ message: "Template backup must be 25 MB or smaller." });
-  }
-  return reply.code(201).send({ filename });
 });
 
 app.get("/api/templates", async () => (db.prepare("SELECT * FROM templates ORDER BY updated_at DESC").all() as TemplateRow[]).map(templateDto));
@@ -412,6 +433,19 @@ if (process.env.NODE_ENV === "production") {
   await app.register(fastifyStatic, { root: distDir, prefix: "/", decorateReply: false });
   app.setNotFoundHandler((request, reply) => request.method === "GET" && request.headers.accept?.includes("text/html") ? reply.sendFile("index.html", distDir) : reply.code(404).send({ message: "Not found." }));
 }
+const runGalleryBackup = async () => {
+  try {
+    const result = await syncGalleryBackups();
+    if (result.written || result.removed) app.log.info({ ...result, directory: downloadDir }, "Gallery backup synchronized");
+  } catch (error) { app.log.error(error, "Gallery backup failed"); }
+};
+await runGalleryBackup();
+const scheduleNightlyGalleryBackup = () => {
+  const now = new Date(); const next = new Date(now); next.setHours(2, 0, 0, 0); if (next <= now) next.setDate(next.getDate() + 1);
+  const timer = setTimeout(async () => { await runGalleryBackup(); scheduleNightlyGalleryBackup(); }, next.getTime() - now.getTime());
+  timer.unref();
+};
+scheduleNightlyGalleryBackup();
 await app.listen({ host: "0.0.0.0", port: Number(process.env.PORT ?? 3001) });
 const close = async () => { await app.close(); if (ocrWorker) await ocrWorker.terminate(); db.close(); process.exit(0); };
 process.on("SIGINT", close); process.on("SIGTERM", close);
