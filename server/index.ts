@@ -140,7 +140,7 @@ type InventoryRow = { code: string; quantity: number; low_threshold: number };
 type InventoryTransactionRow = { id: string; type: string; label: string; changes_json: string; created_at: string };
 type Grid = { title: string; sourceKind: "photo" | "template" | "scratch"; width: number; height: number; cells: Array<string | null>; tags: string[] };
 
-type GalleryBackupManifest = { version: 1; templates: Record<string, { updatedAt: string; filename: string }> };
+type GalleryBackupManifest = { version: 2; templates: Record<string, { updatedAt: string; filename: string }> };
 const galleryBackupManifestPath = path.join(downloadDir, ".gallery-backup.json");
 const fileExists = async (filename: string) => access(filename).then(() => true, () => false);
 async function writeAtomic(filename: string, value: Buffer | string) {
@@ -150,17 +150,17 @@ async function writeAtomic(filename: string, value: Buffer | string) {
   catch (error) { await unlink(temporary).catch(() => undefined); throw error; }
 }
 async function syncGalleryBackups(): Promise<{ written: number; removed: number }> {
-  let manifest: GalleryBackupManifest = { version: 1, templates: {} };
+  let manifest: GalleryBackupManifest = { version: 2, templates: {} };
   try {
     const parsed = JSON.parse(await readFile(galleryBackupManifestPath, "utf8")) as GalleryBackupManifest;
-    if (parsed.version === 1 && parsed.templates && typeof parsed.templates === "object") manifest = parsed;
+    if (parsed.version === 2 && parsed.templates && typeof parsed.templates === "object") manifest = parsed;
   } catch { /* The first sync creates the manifest. */ }
   const rows = db.prepare("SELECT * FROM templates ORDER BY id").all() as TemplateRow[];
   const templates = rows.map((row): GalleryBackupTemplate => ({
     id: row.id, title: row.title, sourceKind: row.source_kind, width: row.width, height: row.height,
     cells: JSON.parse(row.cells_json) as Array<string | null>, tags: JSON.parse(row.tags_json) as string[], updatedAt: row.updated_at,
   }));
-  const next: GalleryBackupManifest = { version: 1, templates: {} };
+  const next: GalleryBackupManifest = { version: 2, templates: {} };
   let written = 0; let removed = 0;
   for (const template of templates) {
     const filename = galleryBackupFilename(template); const destination = path.join(downloadDir, filename);
