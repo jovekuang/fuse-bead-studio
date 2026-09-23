@@ -945,7 +945,7 @@ function TemplateThumbnail({ template }: { template: Template }) {
   return <canvas ref={canvasRef} role="img" aria-label={`Bead template for ${template.title}`} />;
 }
 
-async function exportTemplateImage(template: Template): Promise<void> {
+async function exportTemplateImage(template: Template): Promise<string> {
   const cellSize = 28; const margin = 36; const header = 94; const legendTop = 62;
   const usage = countBeads(template.cells);
   const colors = Object.entries(usage).sort(([left], [right]) => left.localeCompare(right, undefined, { numeric: true }));
@@ -985,9 +985,17 @@ async function exportTemplateImage(template: Template): Promise<void> {
     context.font = "13px Arial, sans-serif"; context.fillText(`× ${count}`, x + 72, y + 17);
   });
   const blob = await new Promise<Blob>((resolve, reject) => canvas.toBlob((value) => value ? resolve(value) : reject(new Error("Could not export template image.")), "image/png"));
+  const downloadName = `${template.title.trim().replace(/[^\p{L}\p{N}._-]+/gu, "-").slice(0, 70) || "bead-template"}.png`;
   const url = URL.createObjectURL(blob); const link = document.createElement("a");
-  link.href = url; link.download = `${template.title.trim().replace(/[^\p{L}\p{N}._-]+/gu, "-").slice(0, 70) || "bead-template"}.png`;
+  link.href = url; link.download = downloadName;
   document.body.append(link); link.click(); link.remove(); window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+  const body = new FormData(); body.append("title", template.title); body.append("image", blob, downloadName);
+  try {
+    const backup = await api<{ filename: string }>("/api/template-exports", { method: "POST", body });
+    return backup.filename;
+  } catch {
+    throw new Error("The PNG was downloaded, but its backup copy could not be saved.");
+  }
 }
 
 function ArtworkTile({ template, artwork, onView, onEdit, onComplete, onExport, onRemoveArtwork, onRemove }: {
@@ -1395,7 +1403,7 @@ function App() {
     finally { setBusy(false); }
   };
   const editTemplate = (template: Template) => { setView("upload"); setDraft({ ...template }); window.scrollTo({ top: 0, behavior: "smooth" }); };
-  const exportTemplate = async (template: Template) => { try { await exportTemplateImage(template); notify("Image exported."); } catch (cause) { notify(cause instanceof Error ? cause.message : "Could not export template.", true); } };
+  const exportTemplate = async (template: Template) => { try { await exportTemplateImage(template); notify("Image exported and backed up."); } catch (cause) { notify(cause instanceof Error ? cause.message : "Could not export template.", true); } };
   const logCompletion = (template: Template) => { setView("gallery"); setCompletionTemplate(template.id); setCompletionOpen(true); };
   const closeCompletion = () => { setCompletionOpen(false); setCompletionFile(null); setCompletionTemplate(""); setCompletionCaption(""); if (artworkInput.current) artworkInput.current.value = ""; };
   const removeTemplate = async () => { if (!deleteTarget || deleteStep !== 2) return; setBusy(true); try { await api(`/api/templates/${deleteTarget.id}`, { method: "DELETE" }); setDeleteTarget(null); setDeleteStep(1); await refresh(); } catch (cause) { notify(cause instanceof Error ? cause.message : "Could not remove template.", true); } finally { setBusy(false); } };

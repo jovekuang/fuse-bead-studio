@@ -27,8 +27,9 @@ const appConfig = (() => {
 const configuredDataDirectory = process.env.DATA_DIR ?? appConfig.dataDirectory ?? "data";
 const dataDir = path.resolve(projectRoot, configuredDataDirectory as string);
 const uploadDir = path.join(dataDir, "uploads");
+const downloadDir = path.join(dataDir, "downloads");
 const distDir = path.join(projectRoot, "dist");
-await mkdir(uploadDir, { recursive: true });
+await Promise.all([mkdir(uploadDir, { recursive: true }), mkdir(downloadDir, { recursive: true })]);
 
 const db = new Database(path.join(dataDir, "fuse-beads.db"));
 db.pragma("journal_mode = WAL");
@@ -229,6 +230,26 @@ app.post("/api/ocr-template", async (request, reply) => {
     }];
   });
   return { words, text: result.data.text ?? "" };
+});
+
+app.post("/api/template-exports", async (request, reply) => {
+  const part = await request.file();
+  if (!part || part.mimetype !== "image/png") {
+    part?.file.resume();
+    return reply.code(415).send({ message: "Template backups must be PNG files." });
+  }
+  const title = formText(part.fields.title).trim().normalize("NFKC")
+    .replace(/[^\p{L}\p{N}._-]+/gu, "-").replace(/^-+|-+$/g, "").slice(0, 70) || "bead-template";
+  const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
+  const filename = `${title}-${timestamp}-${randomUUID().slice(0, 8)}.png`;
+  const destination = path.join(downloadDir, filename);
+  try { await pipeline(part.file, createWriteStream(destination)); }
+  catch (error) { await unlink(destination).catch(() => undefined); throw error; }
+  if (part.file.truncated) {
+    await unlink(destination).catch(() => undefined);
+    return reply.code(413).send({ message: "Template backup must be 25 MB or smaller." });
+  }
+  return reply.code(201).send({ filename });
 });
 
 app.get("/api/templates", async () => (db.prepare("SELECT * FROM templates ORDER BY updated_at DESC").all() as TemplateRow[]).map(templateDto));

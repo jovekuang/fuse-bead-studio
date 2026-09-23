@@ -49,8 +49,10 @@ Photos and the SQLite database are stored in the directory configured by
 `dataDirectory` to either an absolute path or a path relative to the project root.
 The local config is excluded from Git because it can contain a machine-specific path.
 If the config is absent, the app uses `data/`. The `DATA_DIR` environment variable
-can override both locations. Inventory starts at zero with a default low-stock
-threshold of 100 beads per color.
+can override both locations. Uploaded images are stored in `uploads/`. Each exported
+template PNG is also saved in `downloads/` with a unique timestamped filename while
+the browser receives its normal download. Inventory starts at zero with a default
+low-stock threshold of 100 beads per color.
 
 ## Production
 
