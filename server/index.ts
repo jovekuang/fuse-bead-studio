@@ -66,6 +66,24 @@ if (!templateColumns.some((column) => column.name === "tags_json"))
 const artworkColumns = db.prepare("PRAGMA table_info(artworks)").all() as Array<{ name: string }>;
 if (!artworkColumns.some((column) => column.name === "inventory_deducted"))
   db.exec("ALTER TABLE artworks ADD COLUMN inventory_deducted INTEGER NOT NULL DEFAULT 1");
+const obsoleteScratchSources = db.prepare(`
+  SELECT DISTINCT template.source_filename
+  FROM templates template
+  WHERE template.source_kind = 'scratch' AND template.source_filename <> ''
+    AND NOT EXISTS (
+      SELECT 1 FROM templates other
+      WHERE other.source_kind <> 'scratch' AND other.source_filename = template.source_filename
+    )
+    AND NOT EXISTS (
+      SELECT 1 FROM artworks artwork
+      WHERE artwork.photo_filename = template.source_filename
+    )
+`).all() as Array<{ source_filename: string }>;
+db.prepare("UPDATE templates SET source_filename = '' WHERE source_kind = 'scratch'").run();
+for (const row of obsoleteScratchSources) {
+  if (path.basename(row.source_filename) === row.source_filename)
+    await unlink(path.join(uploadDir, row.source_filename)).catch(() => undefined);
+}
 const insertInventory = db.prepare("INSERT OR IGNORE INTO inventory (code) VALUES (?)");
 for (const color of PALETTE) insertInventory.run(color.code);
 
@@ -120,7 +138,7 @@ type InventoryRow = { code: string; quantity: number; low_threshold: number };
 type InventoryTransactionRow = { id: string; type: string; label: string; changes_json: string; created_at: string };
 type Grid = { title: string; sourceKind: "photo" | "template" | "scratch"; width: number; height: number; cells: Array<string | null>; tags: string[] };
 
-const templateDto = (row: TemplateRow) => ({ id: row.id, title: row.title, sourceKind: row.source_kind, sourceUrl: `/uploads/${row.source_filename}`, width: row.width, height: row.height, cells: JSON.parse(row.cells_json) as Array<string | null>, tags: JSON.parse(row.tags_json) as string[], createdAt: row.created_at, updatedAt: row.updated_at });
+const templateDto = (row: TemplateRow) => ({ id: row.id, title: row.title, sourceKind: row.source_kind, sourceUrl: row.source_filename ? `/uploads/${row.source_filename}` : "", width: row.width, height: row.height, cells: JSON.parse(row.cells_json) as Array<string | null>, tags: JSON.parse(row.tags_json) as string[], createdAt: row.created_at, updatedAt: row.updated_at });
 const artworkDto = (row: ArtworkRow) => ({ id: row.id, templateId: row.template_id, templateTitle: row.template_title, photoUrl: `/uploads/${row.photo_filename}`, caption: row.caption, usage: JSON.parse(row.usage_json) as Record<string, number>, inventoryDeducted: Boolean(row.inventory_deducted), createdAt: row.created_at });
 const inventoryDto = (row: InventoryRow) => {
   const color = PALETTE.find((item) => item.code === row.code)!;
@@ -214,7 +232,15 @@ app.post("/api/ocr-template", async (request, reply) => {
 });
 
 app.get("/api/templates", async () => (db.prepare("SELECT * FROM templates ORDER BY updated_at DESC").all() as TemplateRow[]).map(templateDto));
-app.post("/api/templates", async (request, reply) => {
+app.post<{ Body: unknown }>("/api/templates", async (request, reply) => {
+  if (!request.isMultipart()) {
+    const parsed = parseGrid(request.body);
+    if (!parsed.grid) return reply.code(400).send({ message: parsed.error });
+    if (parsed.grid.sourceKind !== "scratch") return reply.code(400).send({ message: "Choose a source picture." });
+    const id = randomUUID(); const now = new Date().toISOString(); const grid = parsed.grid;
+    db.prepare("INSERT INTO templates (id, title, source_filename, source_kind, width, height, cells_json, content_cropped, tags_json, created_at, updated_at) VALUES (?, ?, '', ?, ?, ?, ?, 1, ?, ?, ?)").run(id, grid.title, grid.sourceKind, grid.width, grid.height, JSON.stringify(grid.cells), JSON.stringify(grid.tags), now, now);
+    return reply.code(201).send(templateDto(db.prepare("SELECT * FROM templates WHERE id = ?").get(id) as TemplateRow));
+  }
   const part = await request.file();
   if (!part) return reply.code(400).send({ message: "Choose a source picture." });
   const extension = imageExtensions[part.mimetype];
@@ -228,8 +254,10 @@ app.post("/api/templates", async (request, reply) => {
   catch { parsed = { grid: null, error: "Template data could not be read." }; }
   if (!parsed.grid) { await unlink(destination).catch(() => undefined); return reply.code(400).send({ message: parsed.error }); }
   const grid = parsed.grid;
+  const storedFilename = grid.sourceKind === "scratch" ? "" : filename;
+  if (!storedFilename) await unlink(destination).catch(() => undefined);
   const now = new Date().toISOString();
-  db.prepare("INSERT INTO templates (id, title, source_filename, source_kind, width, height, cells_json, content_cropped, tags_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)").run(id, grid.title, filename, grid.sourceKind, grid.width, grid.height, JSON.stringify(grid.cells), JSON.stringify(grid.tags), now, now);
+  db.prepare("INSERT INTO templates (id, title, source_filename, source_kind, width, height, cells_json, content_cropped, tags_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)").run(id, grid.title, storedFilename, grid.sourceKind, grid.width, grid.height, JSON.stringify(grid.cells), JSON.stringify(grid.tags), now, now);
   return reply.code(201).send(templateDto(db.prepare("SELECT * FROM templates WHERE id = ?").get(id) as TemplateRow));
 });
 app.put<{ Params: { id: string }; Body: unknown }>("/api/templates/:id", async (request, reply) => {
@@ -245,7 +273,7 @@ app.delete<{ Params: { id: string } }>("/api/templates/:id", async (request, rep
   if (!row) return reply.code(404).send({ message: "Template not found." });
   if (db.prepare("SELECT 1 FROM artworks WHERE template_id = ? LIMIT 1").get(row.id)) return reply.code(409).send({ message: "This template has completed artwork and cannot be removed." });
   db.prepare("DELETE FROM templates WHERE id = ?").run(row.id);
-  await unlink(path.join(uploadDir, row.source_filename)).catch(() => undefined);
+  if (row.source_filename) await unlink(path.join(uploadDir, row.source_filename)).catch(() => undefined);
   return reply.code(204).send();
 });
 

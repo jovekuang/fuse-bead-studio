@@ -290,13 +290,6 @@ async function pictureToGrid(file: File, width: number, height: number): Promise
   return { sourceUrl, width, height, cells };
 }
 
-async function scratchSource(width: number, height: number): Promise<File> {
-  const canvas = document.createElement("canvas"); canvas.width = width; canvas.height = height;
-  const context = canvas.getContext("2d")!; context.fillStyle = "#fffdf8"; context.fillRect(0, 0, width, height);
-  const blob = await new Promise<Blob>((resolve, reject) => canvas.toBlob((value) => value ? resolve(value) : reject(new Error("Could not create a blank template.")), "image/png"));
-  return new File([blob], "blank-template.png", { type: "image/png" });
-}
-
 const median = (values: number[]) => {
   values.sort((a, b) => a - b);
   return values[Math.floor(values.length / 2)] ?? 255;
@@ -1374,8 +1367,7 @@ function App() {
       } else if (uploadMode === "template") {
         const grid = await existingTemplateToGrid(sourceFile!, setAnalysisStatus); setDraft({ title, sourceKind: "template", sourceFile: sourceFile!, sourceUrl: grid.sourceUrl, width: grid.width, height: grid.height, cells: grid.cells, tags: [] });
       } else {
-        const sourceFile = await scratchSource(width, height);
-        setDraft({ title, sourceKind: "scratch", sourceFile, sourceUrl: "", width, height, cells: Array(width * height).fill(null), tags: [] });
+        setDraft({ title, sourceKind: "scratch", sourceUrl: "", width, height, cells: Array(width * height).fill(null), tags: [] });
       }
     } catch (cause) { notify(cause instanceof Error ? cause.message : "This image could not be analyzed.", true); }
     finally { setBusy(false); setAnalysisStatus(""); }
@@ -1392,7 +1384,11 @@ function App() {
     setBusy(true);
     try {
       if (draft.id) await api(`/api/templates/${draft.id}`, { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(grid) });
-      else { const body = new FormData(); body.append("grid", JSON.stringify(grid)); body.append("photo", draft.sourceFile!); await api("/api/templates", { method: "POST", body }); }
+      else if (draft.sourceKind === "scratch") await api("/api/templates", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(grid) });
+      else {
+        if (!draft.sourceFile) throw new Error("Choose a source picture.");
+        const body = new FormData(); body.append("grid", JSON.stringify(grid)); body.append("photo", draft.sourceFile); await api("/api/templates", { method: "POST", body });
+      }
       if (!draft.id && draft.sourceUrl.startsWith("blob:")) URL.revokeObjectURL(draft.sourceUrl);
       setDraft(null); setSourceFile(null); setSourceTitle(""); await refresh(); setView("gallery");
     } catch (cause) { notify(cause instanceof Error ? cause.message : "Could not save template.", true); }
