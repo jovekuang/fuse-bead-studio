@@ -1318,7 +1318,7 @@ function App() {
   const [useSearch, setUseSearch] = useState(""); const [useSelected, setUseSelected] = useState<Set<string>>(new Set()); const [useAmounts, setUseAmounts] = useState<Record<string, number>>({});
   const [useMode, setUseMode] = useState<"template" | "colors">("template"); const [useTemplateId, setUseTemplateId] = useState("");
   const [useTemplateSearch, setUseTemplateSearch] = useState(""); const [useTemplatePage, setUseTemplatePage] = useState(0);
-  const [stockHistoryOpen, setStockHistoryOpen] = useState(false); const [stockTransactions, setStockTransactions] = useState<StockTransaction[]>([]); const [stockDeleteTarget, setStockDeleteTarget] = useState<StockTransaction | null>(null);
+  const [stockHistoryOpen, setStockHistoryOpen] = useState(false); const [stockTransactions, setStockTransactions] = useState<StockTransaction[]>([]); const [usageTransactions, setUsageTransactions] = useState<StockTransaction[]>([]); const [stockDeleteTarget, setStockDeleteTarget] = useState<StockTransaction | null>(null);
   const [viewerTemplate, setViewerTemplate] = useState<Template | null>(null);
   const templateInput = useRef<HTMLInputElement>(null); const artworkInput = useRef<HTMLInputElement>(null); const featuredScroller = useRef<HTMLDivElement>(null);
   const scrollFeatured = (direction: -1 | 1) => {
@@ -1340,12 +1340,12 @@ function App() {
       return color?.name.toLowerCase().includes(galleryQuery);
     });
   });
-  const useTransactions = stockTransactions.filter((transaction) => transaction.type === "use");
-  const completedUsage = useTransactions.reduce<Record<string, number>>((totals, transaction) => {
+  const completedUsage = usageTransactions.reduce<Record<string, number>>((totals, transaction) => {
     for (const [code, change] of Object.entries(transaction.changes)) if (change < 0) totals[code] = (totals[code] ?? 0) - change;
     return totals;
   }, {});
-  const completedPieces = useTransactions.filter((transaction) => transaction.label.startsWith("Use beads for artwork: ") || transaction.label.startsWith("Gallery template: ")).length;
+  const completedPieces = usageTransactions.filter((transaction) => transaction.label.startsWith("Use beads for artwork: ") || transaction.label.startsWith("Gallery template: ")).length;
+  const photographedPieces = new Set(artworks.map((artwork) => artwork.templateId ?? artwork.id)).size;
   const totalBeadsUsed = Object.values(completedUsage).reduce((sum, count) => sum + count, 0);
   const topUsedColors = Object.entries(completedUsage).sort((left, right) => right[1] - left[1]).slice(0, 4);
   const topUsedColorCount = topUsedColors[0]?.[1] ?? 1;
@@ -1382,7 +1382,7 @@ function App() {
     if (left.sourceKind !== right.sourceKind) return left.sourceKind === "photo" ? -1 : 1;
     return (rightArtwork?.createdAt ?? right.updatedAt).localeCompare(leftArtwork?.createdAt ?? left.updatedAt);
   }).slice(0, 10);
-  const refresh = async () => { try { const [nextTemplates, nextArtworks, nextInventory, nextTransactions] = await Promise.all([api<Template[]>("/api/templates"), api<Artwork[]>("/api/artworks"), api<Inventory[]>("/api/inventory"), api<StockTransaction[]>("/api/inventory/transactions")]); setTemplates(nextTemplates); setArtworks(nextArtworks); setInventory(nextInventory); setStockTransactions(nextTransactions); } catch (cause) { setError(cause instanceof Error ? cause.message : "Could not load the app."); } };
+  const refresh = async () => { try { const [nextTemplates, nextArtworks, nextInventory, nextTransactions, nextUsageTransactions] = await Promise.all([api<Template[]>("/api/templates"), api<Artwork[]>("/api/artworks"), api<Inventory[]>("/api/inventory"), api<StockTransaction[]>("/api/inventory/transactions"), api<StockTransaction[]>("/api/inventory/usage-transactions")]); setTemplates(nextTemplates); setArtworks(nextArtworks); setInventory(nextInventory); setStockTransactions(nextTransactions); setUsageTransactions(nextUsageTransactions); } catch (cause) { setError(cause instanceof Error ? cause.message : "Could not load the app."); } };
   useEffect(() => { void refresh(); }, []);
   useEffect(() => { setError(""); setMessage(""); }, [view]);
   useEffect(() => { if (!message) return; const timeout = window.setTimeout(() => setMessage(""), 3000); return () => window.clearTimeout(timeout); }, [message]);
@@ -1461,7 +1461,8 @@ function App() {
   const applyInventoryUsage = async (usage: Record<string, number>, label: string) => {
     const updated = await api<Inventory[]>("/api/inventory/use", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ usage, label }) });
     const byCode = new Map(updated.map((item) => [item.code, item])); setInventory((current) => current.map((item) => byCode.get(item.code) ?? item));
-    setStockTransactions(await api<StockTransaction[]>("/api/inventory/transactions"));
+    const [nextTransactions, nextUsageTransactions] = await Promise.all([api<StockTransaction[]>("/api/inventory/transactions"), api<StockTransaction[]>("/api/inventory/usage-transactions")]);
+    setStockTransactions(nextTransactions); setUsageTransactions(nextUsageTransactions);
   };
   const useTemplateFromMaking = async (template: Template) => applyInventoryUsage(countBeads(template.cells), `Use beads for artwork: ${template.title}`);
   const deductInventory = async (event: FormEvent) => {
@@ -1481,7 +1482,7 @@ function App() {
     {error && <div className="notice error" role="alert">{error}<button onClick={() => setError("")}>×</button></div>}{message && <div className="notice success" role="status">{message}<button onClick={() => setMessage("")}>×</button></div>}{lowColors.length > 0 && view === "inventory" && <button className="low-banner" onClick={openLowStock}>⚠ {lowColors.length} bead {lowColors.length === 1 ? "color is" : "colors are"} running low. Review threshold and refill as needed. →</button>}
 
     {view === "home" && <>
-      <section className="home-hero panel"><div><p className="eyebrow">我的拼豆神器</p><h2>今天你拼豆了吗？</h2><p>Turn pictures into bead patterns, keep your favorite work together, and see what colors you have on hand.</p><div className="button-row"><button className="primary-button" onClick={() => setView("upload")}>Upload a template</button><button className="secondary-button" onClick={() => setView("gallery")}>Explore Gallery</button></div></div><div className="home-stats"><div className="finished-pieces-stat"><strong>{artworks.length}</strong><span>Finished pieces</span></div><div className="templates-stat"><strong>{templates.length}</strong><span>Templates</span></div><div className="beads-on-hand-stat"><strong>{totalBeadsOnHand.toLocaleString()}</strong><span>Beads on hand</span></div></div></section>
+      <section className="home-hero panel"><div><p className="eyebrow">我的拼豆神器</p><h2>今天你拼豆了吗？</h2><p>Turn pictures into bead patterns, keep your favorite work together, and see what colors you have on hand.</p><div className="button-row"><button className="primary-button" onClick={() => setView("upload")}>Upload a template</button><button className="secondary-button" onClick={() => setView("gallery")}>Explore Gallery</button></div></div><div className="home-stats"><div className="finished-pieces-stat"><strong>{photographedPieces}</strong><span>Finished with photos</span></div><div className="templates-stat"><strong>{templates.length}</strong><span>Templates</span></div><div className="beads-on-hand-stat"><strong>{totalBeadsOnHand.toLocaleString()}</strong><span>Beads on hand</span></div></div></section>
       <section className="content-section"><div className="section-heading"><div><p className="eyebrow">From your collection</p><h2>Featured Artwork</h2></div><div className="featured-heading-actions"><div className="featured-scroll-buttons" aria-label="Featured artwork controls"><button type="button" aria-label="Previous featured artwork" onClick={() => scrollFeatured(-1)}>‹</button><button type="button" aria-label="Next featured artwork" onClick={() => scrollFeatured(1)}>›</button></div><button className="text-button" onClick={() => setView("gallery")}>More</button></div></div>{featuredTemplates.length ? <div ref={featuredScroller} className="artwork-tiles featured-artwork-scroller">{featuredTemplates.map((template) => { const artwork = latestArtworkByTemplate.get(template.id); return <ArtworkTile key={template.id} template={template} artwork={artwork} onView={() => setViewerTemplate(template)} onEdit={() => editTemplate(template)} onComplete={() => logCompletion(template)} onExport={() => void exportTemplate(template)} onRemoveArtwork={artwork ? () => setArtworkDeleteTarget(artwork) : undefined} />; })}</div> : <Empty title="Your featured artwork starts here" text="Upload a picture or pattern to create your first featured template." />}</section>
     </>}
 

@@ -379,6 +379,7 @@ app.post<{ Body: unknown }>("/api/inventory/use", async (request, reply) => {
 });
 
 app.get("/api/inventory/transactions", async () => (db.prepare("SELECT * FROM inventory_transactions ORDER BY created_at DESC LIMIT 50").all() as InventoryTransactionRow[]).map(transactionDto));
+app.get("/api/inventory/usage-transactions", async () => (db.prepare("SELECT * FROM inventory_transactions WHERE type = 'use' ORDER BY created_at DESC").all() as InventoryTransactionRow[]).map(transactionDto));
 app.delete<{ Params: { id: string } }>("/api/inventory/transactions/:id", async (request, reply) => {
   const row = db.prepare("SELECT * FROM inventory_transactions WHERE id = ?").get(request.params.id) as InventoryTransactionRow | undefined;
   if (!row) return reply.code(404).send({ message: "Stock change not found." });
