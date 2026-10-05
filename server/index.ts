@@ -68,6 +68,19 @@ if (!templateColumns.some((column) => column.name === "tags_json"))
 const artworkColumns = db.prepare("PRAGMA table_info(artworks)").all() as Array<{ name: string }>;
 if (!artworkColumns.some((column) => column.name === "inventory_deducted"))
   db.exec("ALTER TABLE artworks ADD COLUMN inventory_deducted INTEGER NOT NULL DEFAULT 1");
+const supersededArtworks = db.prepare(`
+  SELECT id, photo_filename FROM (
+    SELECT id, photo_filename,
+      ROW_NUMBER() OVER (PARTITION BY template_id ORDER BY created_at DESC, id DESC) AS position
+    FROM artworks WHERE template_id IS NOT NULL
+  ) WHERE position > 1
+`).all() as Array<{ id: string; photo_filename: string }>;
+db.transaction(() => {
+  const removeArtwork = db.prepare("DELETE FROM artworks WHERE id = ?");
+  for (const artwork of supersededArtworks) removeArtwork.run(artwork.id);
+})();
+for (const artwork of supersededArtworks) await unlink(path.join(uploadDir, artwork.photo_filename)).catch(() => undefined);
+db.exec("CREATE UNIQUE INDEX IF NOT EXISTS artworks_one_per_template ON artworks(template_id) WHERE template_id IS NOT NULL");
 const obsoleteScratchSources = db.prepare(`
   SELECT DISTINCT template.source_filename
   FROM templates template
@@ -410,11 +423,14 @@ app.post("/api/artworks", async (request, reply) => {
   const template = db.prepare("SELECT * FROM templates WHERE id = ?").get(templateId) as TemplateRow | undefined;
   if (!template) { await unlink(destination).catch(() => undefined); return reply.code(404).send({ message: "Choose a saved template." }); }
   const usage = countBeads(JSON.parse(template.cells_json) as Array<string | null>);
+  const previousArtwork = db.prepare("SELECT * FROM artworks WHERE template_id = ?").get(template.id) as ArtworkRow | undefined;
   try {
     db.transaction(() => {
+      if (previousArtwork) db.prepare("DELETE FROM artworks WHERE id = ?").run(previousArtwork.id);
       db.prepare("INSERT INTO artworks (id, template_id, template_title, photo_filename, caption, usage_json, inventory_deducted, created_at) VALUES (?, ?, ?, ?, ?, ?, 0, ?)").run(id, template.id, template.title, filename, caption, JSON.stringify(usage), new Date().toISOString());
     })();
   } catch (error) { await unlink(destination).catch(() => undefined); throw error; }
+  if (previousArtwork) await unlink(path.join(uploadDir, previousArtwork.photo_filename)).catch(() => undefined);
   return reply.code(201).send(artworkDto(db.prepare("SELECT * FROM artworks WHERE id = ?").get(id) as ArtworkRow));
 });
 app.delete<{ Params: { id: string } }>("/api/artworks/:id", async (request, reply) => {
